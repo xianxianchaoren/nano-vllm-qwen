@@ -15,23 +15,34 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        # 只从 kwargs 中提取 Config 定义过的字段，其余参数忽略
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+
+        # 全局块大小（KV Cache 每块容纳的 token 数），供所有 Sequence 对象共享
         Sequence.block_size = config.kvcache_block_size
-        self.ps = []
-        self.events = []
+
+        # 张量并行（TP）时，为 rank 1..N-1 各启动一个独立进程作为 worker
+        self.ps = []       # 保存 worker 进程句柄，便于退出时 join
+        self.events = []   # 每个 worker 对应一个 Event，用于通过共享内存同步任务
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
+            # 每个 worker 进程内独立运行一个 ModelRunner（各自持有 NCCL 进程组）
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
+
+        # rank 0 的 ModelRunner 在主进程内运行（负责前向计算与采样）
         self.model_runner = ModelRunner(config, 0, self.events)
+        # 加载 tokenizer，并把 eos token id 写入 config 供调度器判停使用
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        # 创建调度器（维护 waiting/running 队列与 KV Cache 块管理器）
         self.scheduler = Scheduler(config)
+        # 注册退出钩子：进程结束时统一回收 worker 与进程组资源
         atexit.register(self.exit)
 
     def exit(self):
