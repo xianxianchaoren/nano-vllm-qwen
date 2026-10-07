@@ -55,10 +55,14 @@ class Scheduler:
                 break  # 预算耗尽，停止排入
 
             if not seq.block_table:
-                # 新序列（还没有分配 KV 块）：分配 GDN 状态槽位；
-                # 有线性注意力时前缀缓存命中数为 0（状态依赖完整历史）
+                if not self.free_slots:
+                    break  # 没有空闲状态槽位，等后续步骤（可能先做 decode 回收）
+                # 新序列（还没有分配 KV 块）：分配 GDN 状态槽位
                 seq.slot_id = self.free_slots.popleft()
-                num_cached_blocks = 0 if self.has_linear_attention else self.block_manager.can_allocate(seq)
+                # 线性注意力层禁用前缀缓存命中（循环状态依赖完整历史），但仍需检查
+                # 空闲 KV 块是否足够；普通模型则正常查前缀缓存。
+                allocatable = self.block_manager.can_allocate(seq)
+                num_cached_blocks = 0 if (allocatable >= 0 and self.has_linear_attention) else allocatable
                 if num_cached_blocks == -1:
                     self.free_slots.appendleft(seq.slot_id)   # 空闲块不足，归还槽位
                     seq.slot_id = None
@@ -72,6 +76,10 @@ class Scheduler:
             # 若剩余预算装不下当前序列的全部 token，且 batch 里已有其他序列，
             # 则中断（chunked prefill 只允许 batch 中第一个序列分块，避免碎片化）
             if remaining < num_tokens and scheduled_seqs:
+                if seq.slot_id is not None and not seq.block_table:
+                    # 本步刚为该新序列分配了槽位但未真正调度，归还以避免槽位泄漏
+                    self.free_slots.appendleft(seq.slot_id)
+                    seq.slot_id = None
                 break
 
             if not seq.block_table:

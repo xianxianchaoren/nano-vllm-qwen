@@ -37,7 +37,7 @@ import torch.distributed as dist
 
 # 模型层（TP 线性层/embedding）假定进程组已初始化；单进程 gloo 足够覆盖
 if not dist.is_initialized():
-    dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    dist.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:29518", rank=0, world_size=1)
 
 from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
 from nanovllm.utils.context import set_context, reset_context

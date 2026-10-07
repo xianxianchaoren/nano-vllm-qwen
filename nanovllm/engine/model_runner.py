@@ -32,6 +32,11 @@ class ModelRunner:
         # 按架构分派模型：Qwen3.5/3.8（混合 GDN 线性注意力）与 Qwen3 走不同实现
         architectures = getattr(hf_config, "architectures", []) or []
         is_qwen35 = "Qwen3_5ForCausalLM" in architectures or getattr(hf_config, "model_type", "") == "qwen3_5_text"
+        if is_qwen35:
+            # GDN 层用的是未做 TP 切分的普通 nn.Linear，且前向含数据相关的 Python
+            # 循环与 host 同步（.item()），无法被 CUDA graph 捕获，必须强制 eager。
+            assert config.tensor_parallel_size == 1, "Qwen3.5 GDN 层暂不支持张量并行"
+            self.enforce_eager = config.enforce_eager = True
         self.model = Qwen3_5ForCausalLM(hf_config) if is_qwen35 else Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         # GDN 状态池：按最大并发序列数预分配（必须在 warmup 前，warmup 会跑前向）
@@ -153,11 +158,10 @@ class ModelRunner:
             end = start + seqlen_q
             seqlen_k = end
             slot = seq.slot_id if seq.slot_id is not None else i
-            if hasattr(self.model, "conv_pool") and seq.num_cached_tokens == 0:
+            if seq.num_cached_tokens == 0 and hasattr(self.model, "reset_state"):
                 # GDN 状态池槽位清零：从头 prefill 时状态必须从零开始
                 # （槽可能是新分配、复用或抢占后残留的脏数据）
-                self.model.conv_pool[slot].zero_()
-                self.model.rec_pool[slot].zero_()
+                self.model.reset_state(slot)
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)

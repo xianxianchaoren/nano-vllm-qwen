@@ -60,6 +60,7 @@ class Qwen3_5Attention(nn.Module):
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.q_size = self.num_heads // 2 * self.head_dim      # 实际 query 维
+        self.num_q_heads = self.num_heads // 2                 # 实际 query head 数（另一半是 output gate）
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         bias = getattr(config, "attention_bias", False)
@@ -71,9 +72,16 @@ class Qwen3_5Attention(nn.Module):
         # QK Norm：zero-centered，作用于 head_dim
         self.q_norm = ZeroCenteredRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = ZeroCenteredRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        # Partial RoPE
-        partial = getattr(config, "partial_rotary_factor", 1.0)
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        # Partial RoPE。
+        # transformers 5.x 起 rope_theta 不再作为顶层属性挂在 text config 上，
+        # 统一从 rope_parameters 读取（partial_rotary_factor 仍保留旧属性）。
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        partial = getattr(config, "partial_rotary_factor", None)
+        if partial is None:
+            partial = rope_params.get("partial_rotary_factor", 1.0)
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = rope_params.get("rope_theta", 10000.0)
         max_pos = getattr(config, "max_position_embeddings", 262144) or 262144
         self.rotary_emb = get_rope(self.head_dim, rotary_dim=None,
                                    max_position=max_pos, base=rope_theta,
@@ -81,25 +89,29 @@ class Qwen3_5Attention(nn.Module):
         # 延迟导入：Attention 依赖 flash_attn/triton（GPU 环境才可用），
         # 避免构造 GDN-only 模型时引入重依赖
         from nanovllm.layers.attention import Attention
-        self.attn = Attention(self.num_heads // 2, self.head_dim, self.scaling, self.num_kv_heads)
+        self.attn = Attention(self.num_q_heads, self.head_dim, self.scaling, self.num_kv_heads)
 
     def forward(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
         # 拆出 [gated_query, key, value]：query 槽位宽度是 2×q_size
         q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
-        q_gate = q_gate.view(-1, self.num_heads // 2, self.head_dim * 2)
-        q, gate = torch.chunk(q_gate, 2, dim=-1)
-        q = q.reshape(-1, (self.num_heads // 2) * self.head_dim)
-        gate = gate.reshape(-1, (self.num_heads // 2) * self.head_dim)
-        # QK Norm（zero-centered）
-        q = self.q_norm(q.view(-1, self.num_heads // 2, self.head_dim)).view(-1, (self.num_heads // 2) * self.head_dim)
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(-1, self.kv_size)
+        # 必须在 reshape 成 (N, heads, head_dim) 之后再调用 Attention / RoPE：
+        # 二者都按最后一维（head_dim）计算，扁平张量会被错误地对半切分。
+        q_gate = q_gate.view(-1, self.num_q_heads, self.head_dim * 2)
+        q, gate = q_gate.chunk(2, dim=-1)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        # QK Norm（zero-centered，作用于 head_dim）
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # Partial RoPE（作用于 (N, heads, head_dim)）
         q, k = self.rotary_emb(positions, q, k)
-        # 注意力
+        # 注意力（q: (N, nq, hd)，k/v: (N, nkv, hd)）
         o = self.attn(q, k, v)
+        if o.dim() == 4:                     # decode: flash-attn 返回 (B, 1, nq, hd)
+            o = o.squeeze(1)
         o = o * torch.sigmoid(gate)          # output gate
-        out, _ = self.o_proj(o)
-        return out
+        return self.o_proj(o.flatten(1, -1))
 
 
 class Qwen3_5MLP(nn.Module):
@@ -262,6 +274,19 @@ class Qwen3_5ForCausalLM(nn.Module):
     def allocate_mamba_cache(self, num_seqs: int) -> None:
         """为 GDN 层预分配循环状态池（引擎调度器初始化时调用）。"""
         self.model.allocate_mamba_cache(num_seqs)
+
+    @property
+    def conv_pool(self) -> torch.Tensor:
+        return self.model.conv_pool
+
+    @property
+    def rec_pool(self) -> torch.Tensor:
+        return self.model.rec_pool
+
+    def reset_state(self, slot_id: int) -> None:
+        """把某个槽位的 GDN 循环状态清零（新序列 / 抢占后重算时调用）。"""
+        self.model.conv_pool[slot_id].zero_()
+        self.model.rec_pool[slot_id].zero_()
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
