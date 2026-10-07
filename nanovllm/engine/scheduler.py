@@ -22,6 +22,11 @@ class Scheduler:
         self.block_size = config.kvcache_block_size             # KV Cache 每块容纳的 token 数
         # 块管理器：负责 KV Cache 块的分配/释放/前缀缓存命中
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # GDN 状态池槽位（空闲队列）：池大小 = max_num_seqs，每个并发序列占一个槽
+        self.free_slots = deque(range(config.max_num_seqs))
+        # 线性注意力层的循环状态依赖完整历史，前缀缓存会跳过中间计算导致状态错误，
+        # 因此混合注意力模型（Qwen3.5/3.8）禁用前缀缓存命中
+        self.has_linear_attention = "linear_attention" in getattr(config.hf_config, "layer_types", [])
         self.waiting: deque[Sequence] = deque()   # 等待队列：尚未完成 prefill 的序列
         self.running: deque[Sequence] = deque()   # 运行队列：正在生成（decode）的序列
 
@@ -50,9 +55,13 @@ class Scheduler:
                 break  # 预算耗尽，停止排入
 
             if not seq.block_table:
-                # 新序列（还没有分配 KV 块）：先检查前缀缓存命中了多少个块
-                num_cached_blocks = self.block_manager.can_allocate(seq)
+                # 新序列（还没有分配 KV 块）：分配 GDN 状态槽位；
+                # 有线性注意力时前缀缓存命中数为 0（状态依赖完整历史）
+                seq.slot_id = self.free_slots.popleft()
+                num_cached_blocks = 0 if self.has_linear_attention else self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
+                    self.free_slots.appendleft(seq.slot_id)   # 空闲块不足，归还槽位
+                    seq.slot_id = None
                     break  # 空闲块不足，无法为新序列分配，等后续步骤（可能先做 decode）
                 # 本次实际需要计算（排入）的 token 数 = 总 token 数 - 缓存直接复用的 token 数
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
@@ -108,6 +117,10 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True                 # 重新进入时按 prefill 处理
         self.block_manager.deallocate(seq)    # 释放全部块（块内容丢弃，重新计算）
+        # 释放 GDN 状态槽位：重新调度时会分配新槽，重算时从零开始（ModelRunner 清零）
+        if seq.slot_id is not None:
+            self.free_slots.append(seq.slot_id)
+            seq.slot_id = None
         self.waiting.appendleft(seq)          # 插回队首，保证被抢占的序列优先被调度
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -127,4 +140,6 @@ class Scheduler:
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)  # 释放序列占用的全部 KV 块
+                self.free_slots.append(seq.slot_id)  # 归还 GDN 状态槽位，供其他序列复用
+                seq.slot_id = None
                 self.running.remove(seq)            # 移出运行队列
