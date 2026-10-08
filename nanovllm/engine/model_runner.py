@@ -33,15 +33,19 @@ class ModelRunner:
         architectures = getattr(hf_config, "architectures", []) or []
         is_qwen35 = "Qwen3_5ForCausalLM" in architectures or getattr(hf_config, "model_type", "") == "qwen3_5_text"
         if is_qwen35:
-            # GDN 层用的是未做 TP 切分的普通 nn.Linear，且前向含数据相关的 Python
-            # 循环与 host 同步（.item()），无法被 CUDA graph 捕获，必须强制 eager。
             assert config.tensor_parallel_size == 1, "Qwen3.5 GDN 层暂不支持张量并行"
+            # 混合模型默认走 eager：CUDA graph 路径的一致性尚未验证通过
+            # （见 check_graph_consistency.py），先关掉避免默认走未验证路径。
             self.enforce_eager = config.enforce_eager = True
         self.model = Qwen3_5ForCausalLM(hf_config) if is_qwen35 else Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         # GDN 状态池：按最大并发序列数预分配（必须在 warmup 前，warmup 会跑前向）
         if hasattr(self.model, "allocate_mamba_cache"):
-            self.model.allocate_mamba_cache(config.max_num_seqs)
+            # 多分配一个槽位：CUDA graph 会按捕获时的 batch size 补齐 padding 行，
+            # 这些行也会读写 GDN 状态池，必须把它们全部指向同一个"垃圾桶"槽，
+            # 否则会写坏其它序列的状态（KV cache 靠 slot_mapping=-1 免疫，GDN 没有保护）。
+            self.model.allocate_mamba_cache(config.max_num_seqs + 1)
+            self.gdn_scratch_slot = config.max_num_seqs
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -241,6 +245,7 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             if context.seq_slots is not None:
                 graph_vars["seq_slots"][:bs] = context.seq_slots
+                graph_vars["seq_slots"][bs:] = self.gdn_scratch_slot
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -270,6 +275,8 @@ class ModelRunner:
         seq_slots = torch.zeros(max_bs, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # 捕获尺寸不能超过 max_bs：否则会用到超出状态池/KV 容量的 batch（混合模型会越界）
+        self.graph_bs = [bs for bs in self.graph_bs if bs <= max_bs] or [max_bs]
         self.graphs = {}
         self.graph_pool = None
 

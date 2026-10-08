@@ -25,20 +25,91 @@ Delta rule 的关键 insight：普通线性注意力会"无界累积"外积 k⊗
 而 delta rule 先减去旧状态已经能预测的部分（S̃·k），只写误差项，
 因此重复/相似的 key 是"更新既有记忆"而非"叠加噪声"。
 
-本文件提供两种计算模式（数学等价，不同场景用）：
-    - torch_recurrent_gated_delta_rule：逐 token 循环，用于 decode（单步）
-    - torch_chunk_gated_delta_rule  ：按 chunk 并行，用于 prefill（长序列）
-    - Qwen3_5GatedDeltaNet          ：完整层（投影 + short conv + 门控 + 输出）
+delta rule 内核直接使用 FLA（flash-linear-attention）的 Triton 实现：
+    - fused_recurrent_gated_delta_rule：逐 token 递推，用于 decode（单步）
+    - chunk_gated_delta_rule          ：按 chunk 并行，用于 prefill（长序列）
+两者数学等价；FLA 同时支持 varlen、GVA（分组 value 注意力）与 in-kernel L2 归一化，
+也是 vLLM 在非 Hopper/Blackwell 平台上的默认 GDN 后端（Triton/FLA）。
 
-参考实现：transformers modeling_qwen3_5.py（Apache 2.0）。
+本文件保留 GDN 层的其余部分：Qwen3_5GatedDeltaNet（投影 + short conv + 门控 + 输出）。
+
+参考实现：transformers modeling_qwen3_5.py（Apache 2.0）、fla.ops.gated_delta_rule。
 """
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+import triton
+import triton.language as tl
+
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 from nanovllm.layers.layernorm import RMSNormGated
+
+
+# ======================================================================
+# GDN 门控融合内核（对应 vLLM 的 fused gating）
+# ======================================================================
+@triton.jit
+def _gdn_gate_kernel(
+    ba_ptr, a_log_ptr, dt_bias_ptr, g_ptr, beta_ptr,
+    total, H: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """一次算完 GDN 的两个数据相关门控，取代原来 ~8 个 eager 逐元素 kernel。
+
+    输入 ba = in_proj_ba(x)，形状 (N, 2H)：**前 H 列是 b（写入强度候选）、
+    后 H 列是 a（衰减率候选）**（与权重加载顺序一致）。
+
+        beta = sigmoid(b)                                   ∈ (0, 1)
+        g    = -exp(A_log) * softplus(a + dt_bias)          ∈ (-∞, 0]
+
+    softplus 用数值稳定形式 max(x,0) + log1p(exp(-|x|))，与 F.softplus 等价
+    （阈值两侧都一致）。g 以 float32 输出（FLA 的 chunk/recurrent 内核要求），
+    beta 的 dtype 跟随输入（bf16）。
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    row = offs // H
+    h = offs % H
+    base = row * (2 * H)
+    b = tl.load(ba_ptr + base + h, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(ba_ptr + base + H + h, mask=mask, other=0.0).to(tl.float32)
+    a_log = tl.load(a_log_ptr + h, mask=mask, other=0.0).to(tl.float32)
+    dt_bias = tl.load(dt_bias_ptr + h, mask=mask, other=0.0).to(tl.float32)
+    x = a + dt_bias
+    softplus = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
+    g = -tl.exp(a_log) * softplus
+    beta = 1.0 / (1.0 + tl.exp(-b))
+    tl.store(g_ptr + offs, g, mask=mask)
+    tl.store(beta_ptr + offs, beta.to(beta_ptr.dtype.element_ty), mask=mask)
+
+
+def gdn_gate(ba: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor):
+    """融合门控：返回 (beta, g)，形状均与 ba 的前半部分相同 (..., H)。
+
+    beta 为输入 dtype，g 为 float32。
+    """
+    *lead, two_h = ba.shape
+    H = two_h // 2
+    ba2 = ba.reshape(-1, two_h)
+    total = ba2.shape[0] * H
+    beta = torch.empty((ba2.shape[0], H), dtype=ba.dtype, device=ba.device)
+    g = torch.empty((ba2.shape[0], H), dtype=torch.float32, device=ba.device)
+    BLOCK = 256
+    _gdn_gate_kernel[(triton.cdiv(total, BLOCK),)](
+        ba2, a_log, dt_bias, g, beta, total, H=H, BLOCK=BLOCK, num_warps=4)
+    return beta.reshape(*lead, H), g.reshape(*lead, H)
+
+
+def gdn_gate_native(ba: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor):
+    """CPU / 非连续输入时的参考实现（与 transformers 逐行等价）。"""
+    H = ba.shape[-1] // 2
+    b, a = torch.split(ba, [H, H], dim=-1)
+    beta = b.sigmoid()
+    g = -a_log.float().exp() * F.softplus(a.float() + dt_bias)
+    return beta, g
 
 
 # ======================================================================
@@ -79,7 +150,9 @@ def causal_conv1d_fn(
     out = out.to(hidden_states.dtype)
     if return_state:
         # 卷积因果依赖 t-K+1..t，将来算 t+1 只需最近 K-1 个输入
-        conv_state = hidden_states[:, :, -padding:]
+        # 注意：必须 clone —— 输入可能来自 torch.split 之类的"多视图"结果，
+        # 那种视图不允许后续原地 copy_（decode 增量更新会写它）
+        conv_state = hidden_states[:, :, -padding:].clone()
         return out, conv_state
     return out
 
@@ -112,217 +185,101 @@ def causal_conv1d_update(
     return out.to(hidden_states.dtype)
 
 
-def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """沿最后一维做 L2 归一化（与 FLA 库保持一致）。
+def causal_conv1d_varlen(hidden_states, weight, bias=None, activation="silu", cu_seqlens=None):
+    """多序列拼接（flat）张量上的 depthwise 因果卷积。
 
-    QB2019：q/k 归一化后，delta rule 的 rank-one 更新范数有界，
-    避免状态 S 数值爆炸；同时统一了 q·k 的内积尺度。
-    """
-    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x * inv_norm
+    先对整条 flat 序列做一次 fused conv，再只修正每个序列开头 K-1 个位置：
+    这些位置在 flat conv 里会读到"上一个序列"的 token，需要按边界置零重算。
+    修正量只有 S*(K-1) 个位置，代价可忽略，避免逐序列调用卷积。
 
-
-# ======================================================================
-# Gated Delta Rule 内核之（1）：逐 token 递推（decode 用）
-# ======================================================================
-def torch_recurrent_gated_delta_rule(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """逐 token 循环的 gated delta rule。
-
-    形状约定（与 FLA/transformers 一致）：
-        query/key: (batch, seq, num_k_heads, k_dim)      （key head 数）
-        value    : (batch, seq, num_v_heads, v_dim)      （value head 数）
-        g, beta  : (batch, seq, num_v_heads)
-        state    : (batch, num_v_heads, k_dim, v_dim)
-
-    用 gqa_interleave 后 query/key 已重复扩展为 num_v_heads 份，
-    所以这里逐 head 独立递推。
-
-    该实现是"语义教科书"：直接按 Eq.1-5 逐步执行，便于理解原理；
-    每步开销是 (k_dim × v_dim) 的小矩阵运算，decode（seq=1）时刚好。
+    性能要点：修正位的写回**不能**使用 data-dependent 的索引（原实现用
+    `.nonzero()` 选出有效项，会强制一次 device→host 同步，把已经排队的 GPU
+    工作全部等完，是 prefill 阶段 GPU 空转的主要来源）。这里把无效项统一
+    "倾倒"到第 T 列（不参与最终输出），所有无效项写入的都是同一列的当前值，
+    属于 no-op，因此不会与有效写入竞争，全程无 host 同步。
 
     Args:
-        g:     log 空间衰减（≤0），state 每步乘 exp(g)
-        beta:  写入强度（0~1）
-        use_qk_l2norm_in_kernel: 是否在循环内对 q/k 做 L2 归一化
+        hidden_states: (B, C, T)，多序列首尾相接
+        cu_seqlens: (S+1,) 各序列的起止下标（varlen 约定）
     """
-    initial_dtype = query.dtype
-    batch, seq_len, _, k_dim = key.shape
-    num_v_heads, v_dim = value.shape[-2:]
-    decay = g  # 参数名与 flash_linear_attention 一致
+    B, C, T = hidden_states.shape
+    K = weight.shape[-1]
+    out = F.conv1d(
+        hidden_states.to(weight.dtype), weight=weight.unsqueeze(1), bias=bias,
+        padding=K - 1, groups=C,
+    )                                        # (B, C, T + K - 1)：多出的列恰好给"垃圾桶"留位
 
-    # 统一转成 fp32（delta 递推对数值精度敏感）+ 轴序 [B, H, L, D]
-    query, key, value, beta, decay = [
-        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
-        for x in (query, key, value, beta, decay)
-    ]
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
-    # query 按 head 维开根做缩放（与 FLA 对齐，保证注意力量级稳定）
-    query = query / (query.shape[-1] ** 0.5)
+    if cu_seqlens is not None and K > 1:
+        starts = cu_seqlens[:-1].long()
+        ends = cu_seqlens[1:].long()
+        # 需要修正的位置：每个序列的前 K-1 个 token
+        off = torch.arange(K - 1, device=hidden_states.device)
+        pos = starts[:, None] + off[None, :]                 # (S, K-1)
+        valid = (pos < ends[:, None]).reshape(-1)            # 段长不足 K-1 时截断
+        src = pos.reshape(-1)
+        # 无效项（越界或段长不足）→ 垃圾桶列 T；该列不在最终输出里
+        tgt = torch.where(valid, src, torch.full_like(src, T))
+        acc = out.new_zeros(C, src.numel())
+        if bias is not None:
+            acc = acc + bias.view(C, 1)          # 重算的位置同样要带上 bias
+        seg_start = starts.repeat_interleave(K - 1)
+        for j in range(K):
+            s = src - (K - 1) + j
+            ok = valid & (s >= seg_start)
+            # 越界项会被 ok 置零，这里只需保证索引落在 [0, T-1] 内（避免读越界）
+            acc = acc + weight[:, j].view(C, 1) * hidden_states[0][:, s.clamp(0, T - 1)] * ok
+        cur = out[0][:, tgt]                     # 先读（无效项读到的是垃圾桶列的现值）
+        out[0][:, tgt] = torch.where(valid[None, :], acc, cur)
 
-    if initial_state is None:
-        recurrent_state = torch.zeros(
-            (batch, num_v_heads, k_dim, v_dim), dtype=value.dtype, device=value.device)
-    else:
-        recurrent_state = initial_state.to(value)
-
-    output = torch.zeros_like(value)
-    # ----- 核心循环：严格按 Eq.1-5 -----
-    for i in range(seq_len):
-        q_t, k_t, v_t = query[:, :, i], key[:, :, i], value[:, :, i]
-        # (1) 衰减旧状态：S̃ = S · α
-        decay_t = decay[:, :, i].exp()[..., None, None]
-        recurrent_state = recurrent_state * decay_t
-        # (2)+(3) delta 写入：S ← S̃ + β·k⊗(v − S̃ᵀk)
-        beta_t = beta[:, :, i].unsqueeze(-1)
-        kv_mem = (recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)  # S̃ᵀk → 旧记忆的预测
-        delta = (v_t - kv_mem) * beta_t                             # 误差 × 写入强度
-        recurrent_state = recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        # (4) 读出：y = Sᵀq
-        output[:, :, i] = (recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-
-    if not output_final_state:
-        recurrent_state = None
-    return output.transpose(1, 2).contiguous().to(initial_dtype), recurrent_state
+    if activation:
+        out = F.silu(out)
+    return out[..., :T].to(hidden_states.dtype)
 
 
-# ======================================================================
-# Gated Delta Rule 内核之（2）：chunk 并行（prefill 用）
-# ======================================================================
-def torch_chunk_gated_delta_rule(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    chunk_size: int = 64,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """chunk 并行版 gated delta rule（与 recurrent 版本数学等价，用于 prefill）。
+def varlen_conv_state(conv_input, cu_seqlens, pad):
+    """取每个序列最后 pad 个输入，拼成 (S, C, pad) 的 conv_state（供 decode 续算）。
 
-    动机：recurrent 版逐 token 串行，GPU 利用率差。Δrule 更新可以写成
-    一个"线性 sketch"（UT 上三角变换系统），使得：
-        - chunk 内部的全部矩阵运算（intra-chunk attn、UT 求解）互不依赖 → 并行
-        - 只有跨 chunk 的状态传递是顺序的（每 chunk 一次小矩阵乘）
-
-    具体分工（transformers 实现）：
-       Phase 1（并行 part）：对每个 chunk 预计算
-           ut_system      = (k_β ⊗ k) * pair_decay    （chunk 内 delta 累积的系数矩阵）
-           intra_chunk    = (q ⊗ k) * pair_decay      （chunk 内线性注意力项）
-           k_cumdecay     = UT⁻¹(decayed_k_β)         （消去"旧状态预测"）
-           new_values     = UT⁻¹(v_β)                 （UT 上三角求解）
-       Phase 2（顺序 part）：跨 chunk 扫描
-           每个 chunk：y += intra + q @ state
-                       state = state * chunk_decay + k̄ᵀ @ v_new
-    整个算法的计算量从 O(n²) 降到 chunk 粒度的并行（~n/chunk_size 步顺序扫描）。
-
-    Args 与 recurrent 版相同，额外：
-        chunk_size: 序列切块大小（Qwen3.5 默认 64）
+    段长不足 pad 时在左侧补零（右对齐），全程无 host 同步。
     """
-    initial_dtype = query.dtype
-    batch, seq_len, _, k_dim = key.shape
-    num_v_heads, v_dim = value.shape[-2:]
-    recurrent_state_shape = (batch, num_v_heads, k_dim, v_dim)
-    padded_output_shape = (batch, num_v_heads, -1, v_dim)   # -1 由 pad 后长度决定
-    decay = g
-
-    # 统一 fp32 + 轴序 [B, H, L, D]
-    query, key, value, beta, decay = [
-        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
-        for x in (query, key, value, beta, decay)
-    ]
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
-    query = query * (query.shape[-1] ** -0.5)
-
-    # 序列长度补齐到 chunk_size 的整数倍（右侧补 0，alignment 对齐核心理念）
-    pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
-    query, key, value = (F.pad(x, (0, 0, 0, pad_size)) for x in (query, key, value))
-    beta, decay = (F.pad(x, (0, pad_size)) for x in (beta, decay))
-    total_seq_len = seq_len + pad_size
-    num_chunks = total_seq_len // chunk_size
-
-    # β 作用到 k/v 上（"学习率"缩放），再切块 → [B, H, n_chunk, chunk, D]
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    query, key, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, k_beta, v_beta)
-    ]
-    decay = decay.reshape(decay.shape[0], decay.shape[1], -1, chunk_size)
-
-    # chunk 内因果掩码（上三角屏蔽：chunk 内不能看到自己之后的位置）
-    strictly_upper_mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool,
-                                     device=query.device).triu(1)
-    # 对数空间累积衰减：cum_decay[..., t] = Σ_{j≤t} g_j
-    cum_decay = decay.cumsum(dim=3)
-
-    # ---- Phase 1：chunk 内并行部分 ----
-    pairwise_decay = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
-    pairwise_decay = pairwise_decay.masked_fill(strictly_upper_mask, float("-inf"))
-    pairwise_decay = pairwise_decay.exp()          # 位置 j→i 之间累积的衰减系数
-
-    ut_system = (k_beta @ key.transpose(-1, -2)) * pairwise_decay
-    intra_chunk_attn = (query @ key.transpose(-1, -2)) * pairwise_decay
-    decayed_k_beta = k_beta * cum_decay.exp().unsqueeze(-1)
-
-    # 上三角（unit lower）线性系统求解：把 chunk 内 k 步 delta 更新
-    # 压缩成一次矩阵运算（delta rule 的线性可加性）
-    new_values = torch.linalg.solve_triangular(
-        ut_system, v_beta, upper=False, unitriangular=True)
-    k_cumdecay = torch.linalg.solve_triangular(
-        ut_system, decayed_k_beta, upper=False, unitriangular=True)
-
-    if initial_state is None:
-        last_recurrent_state = torch.zeros(
-            recurrent_state_shape, dtype=new_values.dtype, device=new_values.device)
-    else:
-        last_recurrent_state = initial_state.to(new_values)
-    core_attn_out = torch.zeros_like(new_values)
-
-    # 衰减因子拆到每 chunk 头尾，让扫描里只需一次标量-矩阵乘
-    query = query * cum_decay.exp().unsqueeze(-1)
-    key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
-    chunk_decay = cum_decay[..., -1].exp()[..., None, None]
-
-    # ---- Phase 2：跨 chunk 顺序扫描（每 chunk 一次状态更新） ----
-    for i in range(num_chunks):
-        # 本 chunk 对旧状态的"修正"：新值中减去旧状态已能预测的部分（delta rule 本质）
-        v_new = new_values[:, :, i] - k_cumdecay[:, :, i] @ last_recurrent_state
-        inter_chunk_attn = query[:, :, i] @ last_recurrent_state   # 读旧记忆
-        core_attn_out[:, :, i] = inter_chunk_attn + intra_chunk_attn[:, :, i] @ v_new
-        # 状态推进：S ← S·α_chunk + k̄ᵀ·v_new
-        last_recurrent_state = (
-            last_recurrent_state * chunk_decay[:, :, i]
-            + key[:, :, i].transpose(-1, -2) @ v_new
-        )
-    if not output_final_state:
-        last_recurrent_state = None
-
-    core_attn_out = core_attn_out.reshape(padded_output_shape)[:, :, :seq_len]
-    core_attn_out = core_attn_out.transpose(1, 2).to(
-        initial_dtype, memory_format=torch.contiguous_format)
-    return core_attn_out, last_recurrent_state
+    B, C, T = conv_input.shape
+    starts = cu_seqlens[:-1].long()
+    ends = cu_seqlens[1:].long()
+    off = torch.arange(pad, device=conv_input.device)
+    idx = ends[:, None] - pad + off[None, :]                 # (S, pad)
+    valid = idx >= starts[:, None]                           # 越过段首的位置补零
+    gathered = conv_input[0][:, idx.clamp(min=0).reshape(-1)].reshape(C, ends.numel(), pad)
+    gathered = gathered * valid.unsqueeze(0)
+    return gathered.permute(1, 0, 2).contiguous()
 
 
 # ======================================================================
 # GDN 完整层（Qwen3_5GatedDeltaNet）
 # ======================================================================
+
+
+class FusedInputProj(nn.Module):
+    """把若干输入投影融合成一个 GEMM（对应 vLLM 的 qkvz / ba 融合投影）。
+
+    checkpoint 里权重是分开的（in_proj_qkv / in_proj_z / in_proj_b / in_proj_a），
+    加载时按 shard_id 写入对应分段；前向只发一次 GEMM，减少 decode 的 kernel 数与
+    Python/launch 开销。
+    """
+
+    def __init__(self, input_size: int, output_sizes: list[int]):
+        super().__init__()
+        self.output_sizes = output_sizes
+        self.weight = nn.Parameter(torch.empty(sum(output_sizes), input_size))
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int):
+        start = sum(self.output_sizes[:shard_id])
+        end = start + self.output_sizes[shard_id]
+        param.data[start:end].copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight)
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     """Qwen3.5 GDN 注意力层（与 transformers Qwen3_5GatedDeltaNet 对齐）。
 
@@ -379,11 +336,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv_kernel_size = linear_conv_kernel_dim
         self.layer_idx = layer_idx
 
-        # ---- 投影（Qwen3.5 风格：4 个独立投影，bias=False）----
-        self.in_proj_qkv = nn.Linear(hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(hidden_size, self.num_v_heads, bias=False)
+        # ---- 投影（Qwen3.5 风格：checkpoint 是 4 个独立投影，这里融合成 2 个 GEMM）----
+        self.in_proj_qkvz = FusedInputProj(
+            hidden_size, [self.key_dim * 2 + self.value_dim, self.value_dim])
+        self.in_proj_ba = FusedInputProj(
+            hidden_size, [self.num_v_heads, self.num_v_heads])
 
         # ---- short conv：对 [q;k;v] 拼接的 depthwise 因果卷积 ----
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -413,58 +370,85 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,                                          # (B, L, D)
         conv_state: torch.Tensor | None = None,                               # (B, C, K-1)
         recurrent_state: torch.Tensor | None = None,                          # (B, V, Kd, Vd)
+        cu_seqlens: torch.Tensor | None = None,                               # (S+1,) varlen 拼接边界
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """前向：返回 (输出, 新的 conv_state, 新的 recurrent_state)。
 
-        - prefill（L > 1）：causal_conv1d_fn 一次算完，recurrent_state 为 None 时用 chunk 内核
-        - decode（L == 1）：causal_conv1d_update 增量算，recurrent_state 必传 → recurrent 内核
+        三种模式：
+        - varlen prefill（cu_seqlens 非空）：多序列首尾相接，conv 与 chunk 内核各一次算完
+        - decode（L == 1 且带 conv_state）：conv 增量 + recurrent 内核
+        - 普通 prefill（L > 1）：conv 全量 + chunk 内核
         """
         batch, seq_len, _ = hidden_states.shape
+        varlen = cu_seqlens is not None
+        # 单步 decode：conv/recurrent 增量路径（每序列 1 个 token）
+        is_step_decode = (not varlen) and conv_state is not None and seq_len == 1
 
-        # 1) 投影
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)   # (B, C, L) 给 conv
-        z = self.in_proj_z(hidden_states).reshape(batch, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        # 1) 投影（qkvz / ba 各一次 GEMM，split 都是 view，不产生额外 kernel）
+        qkvz = self.in_proj_qkvz(hidden_states)
+        qkv, z = torch.split(
+            qkvz, [self.key_dim * 2 + self.value_dim, self.value_dim], dim=-1)
+        mixed_qkv = qkv.transpose(1, 2)                               # (B, C, L) 给 conv
+        z = z.reshape(batch, seq_len, -1, self.head_v_dim)
+        ba = self.in_proj_ba(hidden_states)
+        # 门控参数：β ∈ (0,1)；g ∈ (−∞, 0]（log 空间）。
+        # decode 单步直接把原始 ba 交给 FLA 的 recurrent 内核，由内核内部完成
+        # sigmoid(b) 与 -exp(A)·softplus(a + dt_bias)（对应 vLLM 融合门控的 decode
+        # 路径），省掉一次独立 kernel 及其张量分配；chunk 内核不支持融合门控，
+        # prefill 仍用下面的融合 Triton kernel 预先算好（替代原先 ~8 个逐元素 kernel）。
+        if is_step_decode:
+            b_raw, a_raw = ba.split(self.num_v_heads, dim=-1)
+            beta = g = None
+        elif ba.is_cuda and ba.stride(-1) == 1 and ba.dtype in (torch.bfloat16, torch.float16):
+            beta, g = gdn_gate(ba, self.A_log, self.dt_bias)
+        else:
+            beta, g = gdn_gate_native(ba, self.A_log, self.dt_bias)
 
-        # 2) short conv（prefill 全量 / decode 增量）
-        new_conv_state = conv_state
-        if new_conv_state is not None and seq_len == 1:
+        # 2) short conv（varlen 全量 / decode 增量 / 普通 prefill 全量）
+        conv_weight = self.conv1d.weight.squeeze(1)
+        if varlen:
+            conv_input = mixed_qkv
+            mixed_qkv = causal_conv1d_varlen(
+                conv_input, conv_weight, self.conv1d.bias, activation="silu",
+                cu_seqlens=cu_seqlens)
+            new_conv_state = varlen_conv_state(
+                conv_input, cu_seqlens, self.conv_kernel_size - 1)
+        elif conv_state is not None and seq_len == 1:
             # decode 单步：拼上历史 → 一次无 padding 卷积，同时原地更新 state
             mixed_qkv = causal_conv1d_update(
-                mixed_qkv, new_conv_state,
-                self.conv1d.weight.squeeze(1), self.conv1d.bias, "silu")
+                mixed_qkv, conv_state, conv_weight, self.conv1d.bias, "silu")
+            new_conv_state = conv_state
         else:
             # prefill 全量：一次算完，并导出最近 K-1 个输入作为后续 decode 的起点
             mixed_qkv, new_conv_state = causal_conv1d_fn(
-                mixed_qkv, self.conv1d.weight.squeeze(1), self.conv1d.bias,
+                mixed_qkv, conv_weight, self.conv1d.bias,
                 activation="silu", return_state=True)
         mixed_qkv = mixed_qkv.transpose(1, 2)                             # 回到 (B, L, C)
 
-        # 3) 拆分 q/k/v（连续布局）并做 head 重排
+        # 3) 拆分 q/k/v（连续布局）
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = query.reshape(batch, seq_len, -1, self.head_k_dim)   # (B, L, nk, Kd)
         key = key.reshape(batch, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch, seq_len, -1, self.head_v_dim)   # (B, L, nv, Vd)
 
-        # 4) 门控参数：β ∈ (0,1)；g ∈ (−∞, 0]（log 空间）
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
-        # 5) GQA 扩展：每个 key head 复制 到 num_v_heads / num_k_heads 份
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # 6) delta rule 内核（decode=recurrent / prefill=chunk）
-        if conv_state is not None and seq_len == 1:
-            core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
-                query, key, value, g=g, beta=beta,
+        # 5) GQA 交给 FLA 的 GVA（HV > H 时内核内部按 key head 分组），与显式
+        #    repeat_interleave 数值完全等价，省掉一次 q/k 复制
+        # 6) delta rule 内核（均为 FLA Triton 实现；scale 与 L2 归一化都在内核内完成）
+        if varlen:
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                query, key, value, g=g, beta=beta, cu_seqlens=cu_seqlens,
+                initial_state=recurrent_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True)
+        elif conv_state is not None and seq_len == 1:
+            core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
+                query, key, value, g=a_raw, beta=b_raw,
+                A_log=self.A_log, dt_bias=self.dt_bias,
+                use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
                 initial_state=recurrent_state, output_final_state=True,
                 use_qk_l2norm_in_kernel=True)
         else:
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 query, key, value, g=g, beta=beta,
                 initial_state=recurrent_state, output_final_state=True,
                 use_qk_l2norm_in_kernel=True)
@@ -474,5 +458,4 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm(core_attn_out, z)                       # RMS(o) × silu(z)
         out = self.out_proj(out.reshape(batch, seq_len, self.value_dim))
-        # 解码路径的 conv_state 已被原地更新（causal_conv1d_update），直接回传
         return out, new_conv_state, last_recurrent_state

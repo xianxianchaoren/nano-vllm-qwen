@@ -16,6 +16,7 @@ dependencies = [
     "triton>=3.0.0",
     "transformers>=4.51.0",
     "flash-attn",
+    "flash-linear-attention>=0.5.0",
     "xxhash",
 ]
 

@@ -193,33 +193,56 @@ class Qwen3_5Model(nn.Module):
         conv_dim = c.linear_key_head_dim * c.linear_num_key_heads * 2 + \
                    c.linear_value_head_dim * c.linear_num_value_heads
         conv_kernel = c.linear_conv_kernel_dim
-        self.conv_pool = torch.zeros(num_seqs, self.num_linear_layers, conv_dim, conv_kernel - 1)
+        # dtype / device 跟随模型参数，而不是依赖调用时的全局默认值
+        param = next(self.parameters())
+        self.conv_pool = torch.zeros(num_seqs, self.num_linear_layers, conv_dim, conv_kernel - 1,
+                                     dtype=param.dtype, device=param.device)
+        # 循环状态池用 float32：与 vLLM 的 `mamba_ssm_dtype: float32` 一致
+        # （FLA 的 chunk/recurrent 内核本身就按 float32 计算并返回 float32 终态），
+        # 池子保持 fp32 可以免去每层每步一次 bf16 回转（24 次 cast + 分配），
+        # 同时避免状态被逐 step 舍入到 bf16 造成的精度损失。
         self.rec_pool = torch.zeros(num_seqs, self.num_linear_layers,
                                     c.linear_num_value_heads, c.linear_key_head_dim,
-                                    c.linear_value_head_dim)
+                                    c.linear_value_head_dim,
+                                    dtype=torch.float32, device=param.device)
 
-    def _apply_linear_mixer(self, layer, x_normed, li, cu_seqlens, seq_slots):
-        """varlen FLAT 序列上执行 GDN 层的循环状态读写。
+    def _apply_linear_mixer_decode(self, layer, x_normed, li, seq_slots):
+        """decode：每个序列恰好 1 个 token，整个 batch 一次算完。
 
-        逐序列循环（正确性优先）：每个序列独立 (1, L, D) 调用层前向，
-        状态从池中取出、更新后写回。L=1（decode）时自动走 recurrent 内核，
-        L>1（prefill/chunked）时走 chunk 内核。
+        状态按 seq_slots 在 GPU 上 gather / scatter，全程无 host 同步、无 Python 循环，
+        对应 vLLM 的批量 GDN decode 内核。
         """
-        num_seqs = cu_seqlens.shape[0] - 1
-        out = torch.empty_like(x_normed)
-        conv = self.conv_pool
-        rec = self.rec_pool
-        for s in range(num_seqs):
-            st, en = int(cu_seqlens[s]), int(cu_seqlens[s + 1])
-            slot = int(seq_slots[st].item())
-            x_seq = x_normed[st:en].unsqueeze(0)                       # (1, L, D)
-            conv_state = conv[slot, li].unsqueeze(0)                    # (1, C, K-1)
-            rec_state = rec[slot, li].unsqueeze(0)                      # (1, V, Kd, Vd)
-            o, new_conv, new_rec = layer.linear_attn(x_seq, conv_state, rec_state)
-            out[st:en] = o[0]
-            conv[slot, li] = new_conv[0]
-            rec[slot, li] = new_rec[0]
-        return out
+        slots = seq_slots.long()                                   # (B,)
+        conv_state = self.conv_pool[slots, li]                     # (B, C, K-1)
+        rec_state = self.rec_pool[slots, li]                       # (B, V, Kd, Vd)
+        o, new_conv, new_rec = layer.linear_attn(
+            x_normed.unsqueeze(1), conv_state, rec_state)          # (B, 1, D)
+        # GDN 内核内部按 float32 计算，返回的循环状态是 float32；状态池是模型 dtype
+        # （bf16）。高级索引 scatter 要求 dtype 严格一致，这里显式转型。
+        if new_conv.dtype != self.conv_pool.dtype:
+            new_conv = new_conv.to(self.conv_pool.dtype)
+        if new_rec.dtype != self.rec_pool.dtype:
+            new_rec = new_rec.to(self.rec_pool.dtype)
+        self.conv_pool[slots, li] = new_conv
+        self.rec_pool[slots, li] = new_rec
+        return o.squeeze(1)
+
+    def _apply_linear_mixer_prefill(self, layer, x_normed, li, cu_seqlens, slots):
+        """prefill：多序列首尾相接，short conv 与 chunk 内核各一次算完。
+
+        状态按 slots 在 GPU 上 gather / scatter，全程无 host 同步、无 Python 循环。
+        """
+        slots = slots.long()
+        rec_state = self.rec_pool[slots, li]                        # (S, V, Kd, Vd)
+        o, new_conv, new_rec = layer.linear_attn(
+            x_normed.unsqueeze(0), None, rec_state, cu_seqlens=cu_seqlens.long())
+        if new_conv.dtype != self.conv_pool.dtype:
+            new_conv = new_conv.to(self.conv_pool.dtype)
+        if new_rec.dtype != self.rec_pool.dtype:
+            new_rec = new_rec.to(self.rec_pool.dtype)
+        self.conv_pool[slots, li] = new_conv
+        self.rec_pool[slots, li] = new_rec
+        return o.squeeze(0)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         ctx = get_context()
@@ -228,14 +251,20 @@ class Qwen3_5Model(nn.Module):
         assert cu_seqlens is not None and seq_slots is not None, \
             "需要 ModelRunner 预先 set_context(cu_seqlens=..., seq_slots=...)"
 
+        # 全程在 GPU 上按槽位寻址（prefill 用每序列一个槽位，decode 用每 token 一个）
+        is_prefill = ctx.is_prefill
+        slots = seq_slots.index_select(0, cu_seqlens[:-1].long()) if is_prefill else None
+
         hidden_states = self.embed_tokens(input_ids)
-        residual = None
         linear_idx = 0
         for layer in self.layers:
             # ---- pre-norm + token mixer（pre-norm 结构，控制流统一在此）----
             x = layer.input_layernorm(hidden_states)
             if layer.block_type == "linear_attention":
-                x = self._apply_linear_mixer(layer, x, linear_idx, cu_seqlens, seq_slots)
+                if is_prefill:
+                    x = self._apply_linear_mixer_prefill(layer, x, linear_idx, cu_seqlens, slots)
+                else:
+                    x = self._apply_linear_mixer_decode(layer, x, linear_idx, seq_slots)
                 linear_idx += 1
             else:
                 x = layer.self_attn(positions, x)
@@ -258,6 +287,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        # GDN 输入投影融合（对应 vLLM 的 create_qkvz_proj / create_ba_proj）：
+        # qkv+z → in_proj_qkvz，b+a → in_proj_ba
+        "in_proj_qkv": ("in_proj_qkvz", 0),
+        "in_proj_z": ("in_proj_qkvz", 1),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
     }
 
     def __init__(self, config) -> None:

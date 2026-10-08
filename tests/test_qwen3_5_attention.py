@@ -65,6 +65,16 @@ from nanovllm.utils.context import set_context, reset_context
 
 torch.manual_seed(0)
 
+# GDN 层的 delta rule 内核由 FLA（Triton）提供，混合层 forward 需要 CUDA
+DEVICE = "cuda" if torch.cuda.is_available() else None
+
+
+def _require_cuda(name):
+    if DEVICE is None:
+        print(f"SKIP  {name} (需要 CUDA：FLA 内核是 Triton 实现)")
+        return False
+    return True
+
 
 def assert_close(a, b, tol=1e-5, msg=""):
     diff = (a.float() - b.float()).abs().max().item()
@@ -121,14 +131,14 @@ def test_rope_params_from_rope_parameters():
 
 def test_gated_attention_forward_matches_reference():
     cfg = build_attn_config()
-    attn = Qwen3_5Attention(cfg)
+    attn = Qwen3_5Attention(cfg).to(DEVICE)
     with torch.no_grad():
         for p in attn.parameters():
             p.copy_(torch.randn_like(p) * 0.1)
 
     n = 5
-    x = torch.randn(n, cfg.hidden_size)
-    positions = torch.arange(n)
+    x = torch.randn(n, cfg.hidden_size, device=DEVICE)
+    positions = torch.arange(n, device=DEVICE)
     out = attn(positions, x)
 
     # 手算参考：与 forward 语义一致
@@ -154,12 +164,15 @@ def test_gated_attention_forward_matches_reference():
 
 
 def test_mixed_model_forward_and_reset_state():
+    if not _require_cuda("test_mixed_model_forward_and_reset_state"):
+        return
     cfg = build_model_config()
     model = Qwen3_5ForCausalLM(cfg)
-    model.allocate_mamba_cache(2)
     with torch.no_grad():
         for p in model.parameters():
             p.uniform_(-0.05, 0.05)
+    model = model.to(DEVICE)
+    model.allocate_mamba_cache(2)
 
     # 脏数据 -> reset_state 清零
     with torch.no_grad():
@@ -171,10 +184,10 @@ def test_mixed_model_forward_and_reset_state():
     assert model.rec_pool[1].abs().sum().item() == 0.0
 
     tokens = [i % 50 + 1 for i in range(6)]
-    ids = torch.tensor(tokens, dtype=torch.long)
-    pos = torch.arange(6)
-    cu = torch.tensor([0, 6], dtype=torch.int32)
-    slots = torch.tensor([0] * 6, dtype=torch.int32)
+    ids = torch.tensor(tokens, dtype=torch.long, device=DEVICE)
+    pos = torch.arange(6, device=DEVICE)
+    cu = torch.tensor([0, 6], dtype=torch.int32, device=DEVICE)
+    slots = torch.tensor([0] * 6, dtype=torch.int32, device=DEVICE)
     set_context(True, cu_seqlens_q=cu, seq_slots=slots)
     try:
         hidden = model(ids, pos)
@@ -189,14 +202,14 @@ def test_mixed_model_forward_and_reset_state():
 def test_decode_shaped_attention_output():
     """回归：decode 时注意力返回 (B, 1, nq, hd)，gate 乘法前必须先 squeeze。"""
     cfg = build_attn_config()
-    attn = Qwen3_5Attention(cfg)
+    attn = Qwen3_5Attention(cfg).to(DEVICE)
     with torch.no_grad():
         for p in attn.parameters():
             p.copy_(torch.randn_like(p) * 0.1)
 
     n = 3
-    x = torch.randn(n, cfg.hidden_size)
-    positions = torch.arange(n)
+    x = torch.randn(n, cfg.hidden_size, device=DEVICE)
+    positions = torch.arange(n, device=DEVICE)
 
     class DecodeStub(nn.Module):
         # 模拟 flash_attn_with_kvcache 的返回形状

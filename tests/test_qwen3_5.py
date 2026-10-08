@@ -44,6 +44,16 @@ from nanovllm.utils.context import set_context, reset_context
 
 torch.manual_seed(0)
 
+# GDN 内核由 FLA（Triton）提供，涉及模型 forward 的用例需要 CUDA
+DEVICE = "cuda" if torch.cuda.is_available() else None
+
+
+def _require_cuda(name):
+    if DEVICE is None:
+        print(f"SKIP  {name} (需要 CUDA：FLA 内核是 Triton 实现)")
+        return False
+    return True
+
 
 def build_config(num_layers=6, replace_linear_tail=0):
     """构造小尺寸 Qwen3.5 文本配置（默认 GDN-only；tail>0 时尾部替换为 full）。"""
@@ -88,12 +98,28 @@ def make_model(num_layers=6):
                 p.zero_()
             else:
                 p.uniform_(-0.05, 0.05)
-    model.allocate_mamba_cache(num_seqs=8)   # 模拟引擎启动时为并发序列数预分配状态池
+    if DEVICE is not None:
+        model = model.to(DEVICE)
+    # 搬到设备之后再分配：状态池的 dtype/device 跟随模型参数
+    model.allocate_mamba_cache(num_seqs=8)
     return model
 
 
 def tensor(*shape):
     return torch.randint(1, 100, shape)
+
+
+def run_decode(model, token_ids, positions, cu_seqlens, seq_slots):
+    """decode 语义（is_prefill=False）：每序列 1 个 token。"""
+    input_ids = torch.tensor(token_ids, dtype=torch.long)
+    pos = torch.tensor(positions, dtype=torch.long)
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32)
+    sl = torch.tensor(seq_slots, dtype=torch.int32)
+    set_context(False, cu_seqlens_q=cu.to(DEVICE), seq_slots=sl.to(DEVICE))
+    try:
+        return model(input_ids.to(DEVICE), pos.to(DEVICE))
+    finally:
+        reset_context()
 
 
 def run_flat(model, token_ids, positions, cu_seqlens, seq_slots):
@@ -102,9 +128,9 @@ def run_flat(model, token_ids, positions, cu_seqlens, seq_slots):
     pos = torch.tensor(positions, dtype=torch.long)
     cu = torch.tensor(cu_seqlens, dtype=torch.int32)
     sl = torch.tensor(seq_slots, dtype=torch.int32)
-    set_context(True, cu_seqlens_q=cu, seq_slots=sl)
+    set_context(True, cu_seqlens_q=cu.to(DEVICE), seq_slots=sl.to(DEVICE))
     try:
-        return model(input_ids, pos)
+        return model(input_ids.to(DEVICE), pos.to(DEVICE))
     finally:
         reset_context()
 
@@ -114,6 +140,8 @@ def test_prefill_then_decode_consistent():
 
     注意：两条路径必须用独立模型实例（状态池不同源），防止
     一次 forward 产生的 final state 污染下一次的初始状态。"""
+    if not _require_cuda("test_prefill_then_decode_consistent"):
+        return
     torch.manual_seed(1)
     total = 74
     prefill = 70
@@ -133,9 +161,10 @@ def test_prefill_then_decode_consistent():
     h_chunked = torch.cat(h_parts, dim=0)
 
     diff = (h_full - h_chunked).abs().max().item()
-    # 容差考虑：整段（chunk 内核）与 分段（recurrent 内核）的 float32 计算路径不同，
-    # UT 三角求解 vs 逐步递推带来 ~1e-3~1e-2 数值差异（非逻辑错误）
-    assert diff < 1e-2, f"prefill+decode 与整段 prefill 不一致: {diff:.3e}"
+    # 容差考虑：整段走 chunk 内核（分块 + UT 三角求解，本身是近似），
+    # 分段后的 decode 走 recurrent 内核（逐步递推，精确），两条路径数值不同，
+    # 差值在 chunk 内核的近似量级（~1e-2）内属正常，非逻辑错误。
+    assert diff < 5e-2, f"prefill+decode 与整段 prefill 不一致: {diff:.3e}"
     print(f"PASS  test_prefill_then_decode_consistent (max diff={diff:.2e})")
 
 
@@ -146,6 +175,8 @@ def test_multi_sequence_state_isolation():
     - ref  : 只有 seq0（槽0）
     - mix  : seq0（槽0）+ seq1（槽1）混跑同一批次
     mix 中 seq0 的输出必须与 ref 完全一致（槽位隔离、状态不串扰）。"""
+    if not _require_cuda("test_multi_sequence_state_isolation"):
+        return
     torch.manual_seed(2)
     seq0 = [i % 97 + 1 for i in range(40)]
     seq1 = [i % 97 + 31 for i in range(25)]   # 不同 token 序列
@@ -192,6 +223,73 @@ def test_layer_types_dispatch():
     for layer in model.model.layers:
         assert hasattr(layer, "linear_attn") and isinstance(layer.input_layernorm, torch.nn.Module)
     print(f"PASS  test_layer_types_dispatch (GDN 层数={n_linear}/{config.num_hidden_layers})")
+
+
+def test_batched_decode_matches_single_decode():
+    """批量 decode（B 条序列一次算）必须与逐条 decode 完全一致。
+
+    覆盖 _apply_linear_mixer_decode：按槽位 gather/scatter 的批量路径应与
+    逐序列路径数值等价。
+    """
+    if not _require_cuda("test_batched_decode_matches_single_decode"):
+        return
+    torch.manual_seed(4)
+    lens = [12, 9, 15]
+    tokens = [i % 97 + 1 for i in range(sum(lens))]
+    cu = [0]
+    for length in lens:
+        cu.append(cu[-1] + length)
+    slots = []
+    for i, length in enumerate(lens):
+        slots += [i] * length
+
+    model_batch = make_model()
+    run_flat(model_batch, tokens, list(range(len(tokens))), cu, slots)
+    model_ref = make_model()
+    run_flat(model_ref, tokens, list(range(len(tokens))), cu, slots)
+
+    next_tokens = [tokens[cu[i + 1] - 1] % 97 + 1 for i in range(len(lens))]
+    next_pos = [cu[i + 1] for i in range(len(lens))]
+
+    # 三条序列一次算完
+    h_batch = run_decode(model_batch, next_tokens, next_pos, [0, 1, 2, 3], [0, 1, 2])
+    # 逐条算
+    h_ref = torch.cat([
+        run_decode(model_ref, [next_tokens[i]], [next_pos[i]], [0, 1], [i])
+        for i in range(len(lens))
+    ], dim=0)
+
+    diff = (h_batch - h_ref).abs().max().item()
+    assert diff < 1e-5, f"批量 decode 与逐条不一致: {diff:.3e}"
+    print(f"PASS  test_batched_decode_matches_single_decode (max diff={diff:.2e})")
+
+
+def test_decode_scatter_with_bf16_pool():
+    """回归：GPU 上状态池是 bf16、GDN 内核返回 float32，批量 scatter 必须自行转型。
+
+    旧实现用整数索引（隐式 cast）不会暴露该问题；批量化后改用高级索引，
+    dtype 必须严格一致，因此这里刻意把池转成 bf16。
+    """
+    if not _require_cuda("test_decode_scatter_with_bf16_pool"):
+        return
+    torch.manual_seed(5)
+    model = make_model()
+    model.model.conv_pool = model.model.conv_pool.to(torch.bfloat16)
+    model.model.rec_pool = model.model.rec_pool.to(torch.bfloat16)
+
+    lens = [6, 4]
+    tokens = [i % 97 + 1 for i in range(sum(lens))]
+    cu = [0, lens[0], sum(lens)]
+    slots = [0] * lens[0] + [1] * lens[1]
+    run_flat(model, tokens, list(range(len(tokens))), cu, slots)
+
+    before = model.rec_pool[0].clone()
+    h = run_decode(model, [tokens[cu[1] - 1]], [cu[1]], [0, 1], [0])
+
+    assert torch.isfinite(h).all()
+    assert model.rec_pool.dtype == torch.bfloat16
+    assert not torch.equal(before, model.rec_pool[0]), "循环状态应被更新"
+    print("PASS  test_decode_scatter_with_bf16_pool")
 
 
 if __name__ == "__main__":

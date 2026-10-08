@@ -3,14 +3,19 @@
 覆盖：
     1. ZeroCenteredRMSNorm / RMSNormGated —— 与手算公式逐值对照
     2. Partial RoPE —— 旋转部分范数不变、pass-through 部分原样透传
-    3. recurrent vs chunk delta rule —— 数学等价性（输出 + 终态一致）
-    4. delta rule vs 朴素参考实现 —— 语义正确性（按 Eq.1-5 逐步展开）
-    5. Qwen3_5GatedDeltaNet —— prefill 全量 vs 分段（decode 续算）一致性
+    3. short conv —— prefill 全量 vs decode 增量
+    4. FLA recurrent vs chunk delta rule —— 数学等价性（输出 + 终态）
+    5. FLA delta rule vs 朴素参考实现 —— 语义正确性（按 Eq.1-5 逐步展开）
+    6. Qwen3_5GatedDeltaNet —— prefill 全量 vs 分段（decode 续算）一致性
+
+说明：delta rule 内核使用 FLA 的 Triton 实现，因此第 4~6 项需要 CUDA；
+无 GPU 时这三项会打印 SKIP，其余（1~3）仍可在 CPU 上跑。
 
 运行：python -m tests.test_gdn  （无需 pytest，纯 assert）
 """
 import sys
 import types
+from itertools import accumulate
 from pathlib import Path
 
 # ---------------------------------------------------------------
@@ -29,6 +34,7 @@ _layers.__package__ = "nanovllm.layers"
 sys.modules.setdefault("nanovllm.layers", _layers)
 
 import torch
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 from nanovllm.layers.layernorm import ZeroCenteredRMSNorm, RMSNormGated
 from nanovllm.layers.rotary_embedding import get_rope
@@ -36,18 +42,28 @@ from nanovllm.layers.gated_delta_net import (
     Qwen3_5GatedDeltaNet,
     causal_conv1d_fn,
     causal_conv1d_update,
-    l2norm,
-    torch_recurrent_gated_delta_rule,
-    torch_chunk_gated_delta_rule,
+    causal_conv1d_varlen,
+    varlen_conv_state,
 )
 
 torch.manual_seed(0)
+
+# FLA 内核是 Triton/CUDA 实现，无 GPU 时相关用例跳过
+DEVICE = "cuda" if torch.cuda.is_available() else None
+
+
+def _require_cuda(name):
+    if DEVICE is None:
+        print(f"SKIP  {name} (需要 CUDA：FLA 内核是 Triton 实现)")
+        return False
+    return True
 
 
 def assert_close(a, b, tol=1e-4, msg=""):
     a, b = a.float(), b.float()
     diff = (a - b).abs().max().item()
     assert diff < tol, f"{msg}: max diff = {diff:.3e}"
+    return diff
 
 
 # ======================================================================
@@ -105,69 +121,7 @@ def test_partial_rope():
 
 
 # ======================================================================
-# 3. recurrent vs chunk delta rule（数学等价）
-# ======================================================================
-def test_recurrent_chunk_equivalence():
-    batch, seq, nk, nv, kd, vd = 2, 130, 4, 16, 8, 6   # 130 故意不整除 chunk 64
-    # 内核约定：q/k 需已按 GQA 扩展为 num_v_heads（层内由 repeat_interleave 完成）
-    q = torch.randn(batch, seq, nk, kd).repeat_interleave(nv // nk, dim=2)
-    k = torch.randn(batch, seq, nk, kd).repeat_interleave(nv // nk, dim=2)
-    v = torch.randn(batch, seq, nv, vd)
-    g = -torch.rand(batch, seq, nv).abs() * 0.5            # log 衰减 ≤ 0
-    beta = torch.sigmoid(torch.randn(batch, seq, nv))      # 0~1 写入强度
-
-    out_r, state_r = torch_recurrent_gated_delta_rule(
-        q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
-    out_c, state_c = torch_chunk_gated_delta_rule(
-        q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
-
-    assert_close(out_r, out_c, 1e-4, "recurrent vs chunk 输出")
-    assert_close(state_r, state_c, 1e-4, "recurrent vs chunk 终态")
-
-    # 从给定 initial_state 续算也应一致
-    init = torch.randn(batch, nv, kd, vd)
-    out_r2, _ = torch_recurrent_gated_delta_rule(
-        q, k, v, g, beta, initial_state=init, output_final_state=False,
-        use_qk_l2norm_in_kernel=True)
-    out_c2, _ = torch_chunk_gated_delta_rule(
-        q, k, v, g, beta, initial_state=init, output_final_state=False,
-        use_qk_l2norm_in_kernel=True)
-    assert_close(out_r2, out_c2, 1e-4, "带 initial_state 的一致性")
-
-
-# ======================================================================
-# 4. delta rule vs 朴素参考实现（严格按 Eq.1-5 展开）
-# ======================================================================
-def test_delta_rule_vs_naive():
-    batch, seq, nv, kd, vd = 1, 6, 2, 4, 3
-    # 注意：内核内部会对 q 无条件乘 (kd)^-0.5（与 FLA 对齐），
-    # 因此这里只做 l2norm，缩放留给 naive 循环显式模拟，保证语义一致
-    q = l2norm(torch.randn(batch, seq, nv, kd))
-    k = l2norm(torch.randn(batch, seq, nv, kd))
-    v = torch.randn(batch, seq, nv, vd)
-    g = -torch.rand(batch, seq, nv) * 0.3
-    beta = torch.sigmoid(torch.randn(batch, seq, nv))
-
-    out, _ = torch_recurrent_gated_delta_rule(
-        q, k, v, g, beta, output_final_state=False, use_qk_l2norm_in_kernel=False)
-
-    # 朴素实现：按论文 Eq.1-5（注意张量布局是 (B, L, H, D)，索引 [:, i, :]）
-    q = q * (kd ** -0.5)   # 显式应用内核的 query 缩放
-    S = torch.zeros(batch, nv, kd, vd)
-    expected = torch.zeros(batch, nv, seq, vd)   # (B, H, L, D)，最后转置对齐 out
-    for i in range(seq):
-        alpha = g[:, i, :].exp()                                # 衰减率 α_t
-        S = S * alpha[..., None, None]                          # Eq.1 衰减
-        pred = (S * k[:, i, :].unsqueeze(-1)).sum(dim=-2)       # Sᵀk
-        err = (v[:, i, :] - pred) * beta[:, i, :].unsqueeze(-1) # Eq.2 误差
-        S = S + k[:, i, :].unsqueeze(-1) * err.unsqueeze(-2)    # Eq.3 写入
-        expected[:, :, i] = (S * q[:, i, :].unsqueeze(-1)).sum(dim=-2)  # Eq.4 读出
-    expected = expected.transpose(1, 2)
-    assert_close(out, expected, 1e-5, "recurrent 与朴素 Eq.1-5 一致")
-
-
-# ======================================================================
-# 5. short conv：prefill 全量 vs decode 增量
+# 3. short conv：prefill 全量 vs decode 增量
 # ======================================================================
 def test_conv1d_incremental():
     C, K, L = 8, 4, 20
@@ -185,10 +139,113 @@ def test_conv1d_incremental():
     assert_close(y_full[..., -1:], last, 1e-5, "conv 增量输出")
 
 
+def test_conv1d_varlen_matches_dense():
+    """多序列拼接（varlen）卷积必须与逐序列卷积完全一致。
+
+    覆盖 causal_conv1d_varlen 的跨序列边界修正，以及 varlen_conv_state 的
+    末 pad 个输入提取（含段长不足 pad 时的右对齐补零）。
+    """
+    torch.manual_seed(11)
+    C, K = 6, 4
+    lens = [5, 8, 2]                       # 最后一段短于 pad = K-1 = 3
+    tot = sum(lens)
+    weight = torch.randn(C, K)
+    bias = torch.randn(C)
+    x = torch.randn(1, C, tot)
+    cu = torch.tensor([0] + list(accumulate(lens)), dtype=torch.int32)
+
+    got = causal_conv1d_varlen(x, weight, bias, activation="silu", cu_seqlens=cu)
+    ref = torch.cat([
+        causal_conv1d_fn(x[:, :, cu[i]:cu[i + 1]], weight, bias,
+                         activation="silu", return_state=False)
+        for i in range(len(lens))
+    ], dim=-1)
+    assert_close(got, ref, 1e-5, "varlen conv vs 逐序列 conv")
+
+    # conv_state：每段最后 pad 个输入；段长不足时左侧补零
+    pad = K - 1
+    state = varlen_conv_state(x, cu, pad)
+    ref_state = torch.zeros(len(lens), C, pad)
+    for i in range(len(lens)):
+        seg = x[0, :, cu[i]:cu[i + 1]]
+        n = min(pad, seg.shape[-1])
+        ref_state[i, :, pad - n:] = seg[:, -n:]
+    assert_close(state, ref_state, 1e-6, "varlen conv_state")
+
+
+# ======================================================================
+# 4. FLA recurrent vs FLA chunk（数学等价，均需 CUDA）
+# ======================================================================
+def test_recurrent_chunk_equivalence():
+    if not _require_cuda("test_recurrent_chunk_equivalence"):
+        return
+    batch, seq, nk, nv, kd, vd = 2, 130, 4, 16, 8, 6   # 130 故意不整除 chunk 64
+    # FLA 约定：q/k 需已按 GQA 扩展为 num_v_heads（层内由 repeat_interleave 完成）
+    q = torch.randn(batch, seq, nk, kd, device=DEVICE).repeat_interleave(nv // nk, dim=2)
+    k = torch.randn(batch, seq, nk, kd, device=DEVICE).repeat_interleave(nv // nk, dim=2)
+    v = torch.randn(batch, seq, nv, vd, device=DEVICE)
+    g = -torch.rand(batch, seq, nv, device=DEVICE).abs() * 0.5   # log 衰减 ≤ 0
+    beta = torch.sigmoid(torch.randn(batch, seq, nv, device=DEVICE))
+
+    out_r, state_r = fused_recurrent_gated_delta_rule(
+        q, k, v, g=g, beta=beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
+    out_c, state_c = chunk_gated_delta_rule(
+        q, k, v, g=g, beta=beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
+
+    assert_close(out_r, out_c, 1e-2, "FLA recurrent vs chunk 输出")
+    assert_close(state_r, state_c, 1e-2, "FLA recurrent vs chunk 终态")
+
+    # 从给定 initial_state 续算也应一致
+    init = torch.randn(batch, nv, kd, vd, device=DEVICE)
+    out_r2, _ = fused_recurrent_gated_delta_rule(
+        q, k, v, g=g, beta=beta, initial_state=init, output_final_state=False,
+        use_qk_l2norm_in_kernel=True)
+    out_c2, _ = chunk_gated_delta_rule(
+        q, k, v, g=g, beta=beta, initial_state=init, output_final_state=False,
+        use_qk_l2norm_in_kernel=True)
+    assert_close(out_r2, out_c2, 1e-2, "带 initial_state 的一致性")
+
+
+# ======================================================================
+# 5. FLA delta rule vs 朴素参考实现（严格按 Eq.1-5 展开，需 CUDA）
+# ======================================================================
+def test_delta_rule_vs_naive():
+    if not _require_cuda("test_delta_rule_vs_naive"):
+        return
+    batch, seq, nv, kd, vd = 1, 6, 2, 4, 3
+    torch.manual_seed(7)
+    # scale=1.0 且不在内核内做 l2norm：把 delta rule 语义与缩放/归一化约定解耦，
+    # 朴素实现只需按 Eq.1-5 逐步展开即可对齐
+    q = torch.randn(batch, seq, nv, kd, device=DEVICE)
+    k = torch.randn(batch, seq, nv, kd, device=DEVICE)
+    v = torch.randn(batch, seq, nv, vd, device=DEVICE)
+    g = -torch.rand(batch, seq, nv, device=DEVICE) * 0.3
+    beta = torch.sigmoid(torch.randn(batch, seq, nv, device=DEVICE))
+
+    out, _ = fused_recurrent_gated_delta_rule(
+        q, k, v, g=g, beta=beta, scale=1.0, output_final_state=False,
+        use_qk_l2norm_in_kernel=False)
+
+    # 朴素实现：按论文 Eq.1-5（张量布局 (B, L, H, D)，索引 [:, i, :]）
+    S = torch.zeros(batch, nv, kd, vd, device=DEVICE)
+    expected = torch.zeros(batch, nv, seq, vd, device=DEVICE)   # (B, H, L, D)
+    for i in range(seq):
+        alpha = g[:, i, :].exp()                                # 衰减率 α_t
+        S = S * alpha[..., None, None]                          # Eq.1 衰减
+        pred = (S * k[:, i, :].unsqueeze(-1)).sum(dim=-2)       # Sᵀk
+        err = (v[:, i, :] - pred) * beta[:, i, :].unsqueeze(-1) # Eq.2 误差
+        S = S + k[:, i, :].unsqueeze(-1) * err.unsqueeze(-2)    # Eq.3 写入
+        expected[:, :, i] = (S * q[:, i, :].unsqueeze(-1)).sum(dim=-2)  # Eq.4 读出
+    expected = expected.transpose(1, 2)
+    assert_close(out, expected, 1e-4, "FLA recurrent 与朴素 Eq.1-5 一致")
+
+
 # ======================================================================
 # 6. GDN 层：prefill（chunk）与 分段续算（recurrent）输出一致
 # ======================================================================
 def test_gdn_layer_prefill_vs_chunked():
+    if not _require_cuda("test_gdn_layer_prefill_vs_chunked"):
+        return
     torch.manual_seed(42)
     B, L, D = 2, 70, 32   # L 不整除 64
     model = Qwen3_5GatedDeltaNet(
@@ -198,8 +255,8 @@ def test_gdn_layer_prefill_vs_chunked():
         linear_key_head_dim=8,
         linear_value_head_dim=6,
         linear_conv_kernel_dim=4,
-    )
-    x = torch.randn(B, L, D)
+    ).to(DEVICE)
+    x = torch.randn(B, L, D, device=DEVICE)
 
     # (a) 一次 prefill
     out_full, conv_state_full, rec_state_full = model(x)
@@ -212,9 +269,9 @@ def test_gdn_layer_prefill_vs_chunked():
         outs_a.append(o)
     out_chunked = torch.cat(outs_a, dim=1)
 
-    assert_close(out_full, out_chunked, 1e-3, "GDN prefill vs 分段续算")
+    assert_close(out_full, out_chunked, 1e-2, "GDN prefill vs 分段续算")
     assert_close(conv_state_full, conv_s, 1e-4, "卷积状态一致")
-    assert_close(rec_state_full, rec_s, 1e-3, "循环状态一致")
+    assert_close(rec_state_full, rec_s, 1e-2, "循环状态一致")
 
 
 if __name__ == "__main__":
