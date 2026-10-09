@@ -34,9 +34,14 @@ class ModelRunner:
         is_qwen35 = "Qwen3_5ForCausalLM" in architectures or getattr(hf_config, "model_type", "") == "qwen3_5_text"
         if is_qwen35:
             assert config.tensor_parallel_size == 1, "Qwen3.5 GDN 层暂不支持张量并行"
-            # 混合模型默认走 eager：CUDA graph 路径的一致性尚未验证通过
-            # （见 check_graph_consistency.py），先关掉避免默认走未验证路径。
-            self.enforce_eager = config.enforce_eager = True
+            # 混合模型（GDN）也走 CUDA graph（decode 阶段），需强制 eager 时传
+            # enforce_eager=True（或 EAGER=1 python bench_qwen3_5.py）。
+            #
+            # 数值特性（实测）：graph 与 eager 的**持久状态逐字节一致**
+            # （KV cache / conv / rec 池），logits 差异在 ~1-2 ulp(bf16) 量级且
+            # 每次重放完全确定；max_num_seqs=8 时逐 token 一致（check_graph_
+            # consistency.py 默认配置 PASS），max_num_seqs=16 时该 ulp 差异经
+            # 采样（temperature>0）放大后偶有 token 翻转，追求严格可复现时用 eager。
         self.model = Qwen3_5ForCausalLM(hf_config) if is_qwen35 else Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         # GDN 状态池：按最大并发序列数预分配（必须在 warmup 前，warmup 会跑前向）

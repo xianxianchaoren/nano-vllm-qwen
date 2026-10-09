@@ -42,7 +42,10 @@ from nanovllm.layers.gated_delta_net import (
     Qwen3_5GatedDeltaNet,
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_update_split,
     causal_conv1d_varlen,
+    fla_recurrent_decode,
+    gdn_recurrent_pool_decode,
     varlen_conv_state,
 )
 
@@ -256,6 +259,14 @@ def test_gdn_layer_prefill_vs_chunked():
         linear_value_head_dim=6,
         linear_conv_kernel_dim=4,
     ).to(DEVICE)
+    # FusedInputProj / TP 线性层用 torch.empty 初始化（正式路径依赖 checkpoint 加载），
+    # 随机单测必须自己填充，否则会读到未初始化内存（NaN/垃圾），测试结果不可复现。
+    # A_log / dt_bias 保留模块自身的初始化（保证 g = -exp(A)·softplus(a + dt) 的量级合理）。
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "A_log" in name or "dt_bias" in name:
+                continue
+            p.uniform_(-0.05, 0.05)
     x = torch.randn(B, L, D, device=DEVICE)
 
     # (a) 一次 prefill
@@ -272,6 +283,254 @@ def test_gdn_layer_prefill_vs_chunked():
     assert_close(out_full, out_chunked, 1e-2, "GDN prefill vs 分段续算")
     assert_close(conv_state_full, conv_s, 1e-4, "卷积状态一致")
     assert_close(rec_state_full, rec_s, 1e-2, "循环状态一致")
+
+
+def test_conv1d_update_split():
+    """decode 融合 conv 必须与"独立参考 + 逐算子实现"逐值一致。
+
+    CPU 上走 fallback（逐算子 torch 实现）；CUDA 上走融合 Triton 内核，并把
+    [q|k|v] 三段直接写成连续缓冲区。两条路径都要对上同一个参考，才能保证
+    "换内核"不改变语义、布局变化也不影响下游。
+    """
+    torch.manual_seed(13)
+    B, key_dim, value_dim, K = 2, 2, 4, 4
+    conv_dim = 2 * key_dim + value_dim
+    dev = DEVICE or "cpu"
+    weight = torch.randn(conv_dim, K, device=dev)
+    bias = torch.randn(conv_dim, device=dev)
+    x = torch.randn(B, conv_dim, 1, device=dev)
+    state = torch.randn(B, conv_dim, K - 1, device=dev)
+
+    # 参考 1：独立公式 —— 窗口 = [state | x]（长度恰好 K），逐通道加权求和 → bias → silu
+    win = torch.cat([state, x], dim=-1)
+    ref = torch.nn.functional.silu((win * weight.unsqueeze(0)).sum(-1) + bias)
+    ref_q, ref_k, ref_v = ref.split([key_dim, key_dim, value_dim], dim=-1)
+    # 参考 2：逐算子实现（语义相同、实现不同）
+    state_ref = state.clone()
+    out_ref = causal_conv1d_update(x, state_ref, weight, bias, "silu")
+    op_q, op_k, op_v = torch.split(
+        out_ref.transpose(1, 2), [key_dim, key_dim, value_dim], dim=-1)
+
+    state_new = state.clone()
+    q, k, v = causal_conv1d_update_split(x, state_new, weight, bias, key_dim, "silu")
+
+    for name, got, exp in (("q", q, ref_q), ("k", k, ref_k), ("v", v, ref_v)):
+        assert got.shape == (B, 1, exp.shape[-1]), f"{name} 形状不符: {got.shape}"
+        assert_close(got.squeeze(1), exp, 1e-5, f"融合 conv {name} vs 独立参考")
+    assert_close(q.squeeze(1), op_q.squeeze(1), 1e-5, "融合 conv q vs 逐算子实现")
+    assert_close(k.squeeze(1), op_k.squeeze(1), 1e-5, "融合 conv k vs 逐算子实现")
+    assert_close(v.squeeze(1), op_v.squeeze(1), 1e-5, "融合 conv v vs 逐算子实现")
+    # conv_state 原地左移一位、末位写当前输入（= 窗口的最后 state_len 项）
+    assert_close(state_new, win[..., -(K - 1):], 1e-6, "conv_state 移位语义")
+    assert_close(state_new, state_ref, 1e-6, "conv_state vs 逐算子实现")
+
+    # 无 bias（Qwen3.5 实际配置：conv bias=False）
+    state_nb = state.clone()
+    q_nb, k_nb, v_nb = causal_conv1d_update_split(
+        x, state_nb, weight, None, key_dim, "silu")
+    ref_nb = torch.nn.functional.silu((win * weight.unsqueeze(0)).sum(-1))
+    nb_q, nb_k, nb_v = ref_nb.split([key_dim, key_dim, value_dim], dim=-1)
+    assert_close(q_nb.squeeze(1), nb_q, 1e-5, "无 bias 时融合 conv q")
+    assert_close(k_nb.squeeze(1), nb_k, 1e-5, "无 bias 时融合 conv k")
+    assert_close(v_nb.squeeze(1), nb_v, 1e-5, "无 bias 时融合 conv v")
+
+    if DEVICE is not None:
+        # 融合路径必须真的被走到，且产物是连续缓冲区（下游 FLA 直接吃，免拷贝）
+        from nanovllm.layers.triton_launch import _LAUNCHERS
+        assert any(kk[0] == "conv_update_split" for kk in _LAUNCHERS), \
+            "融合 conv 内核未被使用"
+        for name, t in (("q", q), ("k", k), ("v", v)):
+            assert t.is_contiguous(), f"融合 conv 的 {name} 必须是连续缓冲区"
+
+
+def test_fla_recurrent_bound_launcher():
+    """预绑定启动器必须与 FLA 公开 API 逐值一致（同一 kernel、同一组 constexpr）。
+
+    额外覆盖：非连续输入必须**回退**公开 API（内核没有 stride 入参，预绑定路径
+    绕开了 input_guard 的 .contiguous()，带错误布局发射会静默算错 batch 维）。
+    """
+    if not _require_cuda("test_fla_recurrent_bound_launcher"):
+        return
+    torch.manual_seed(17)
+    B, nk, nv, kd, vd = 4, 2, 4, 8, 6
+    q = torch.randn(B, 1, nk, kd, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(B, 1, nk, kd, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(B, 1, nv, vd, device=DEVICE, dtype=torch.bfloat16)
+    # 门控：g 是 log 空间（∈ (−∞,0]）的 float32，beta 已过 sigmoid
+    g = -torch.rand(B, 1, nv, device=DEVICE).abs() * 0.5
+    beta = torch.sigmoid(torch.randn(B, 1, nv, device=DEVICE, dtype=torch.bfloat16))
+    h0 = torch.randn(B, nv, kd, vd, device=DEVICE)
+
+    ref_out, ref_state = fused_recurrent_gated_delta_rule(
+        q, k, v, g=g, beta=beta,
+        initial_state=h0, output_final_state=True, use_qk_l2norm_in_kernel=True)
+    out, state = fla_recurrent_decode(
+        q, k, v, g, beta, h0,
+        fallback=lambda: fused_recurrent_gated_delta_rule(
+            q, k, v, g=g, beta=beta,
+            initial_state=h0, output_final_state=True, use_qk_l2norm_in_kernel=True))
+
+    assert out.shape == ref_out.shape and state.shape == ref_state.shape
+    assert_close(out, ref_out, 1e-6, "预绑定启动器输出 vs FLA 公开 API")
+    assert_close(state, ref_state, 1e-6, "预绑定启动器终态 vs FLA 公开 API")
+
+    from nanovllm.layers.triton_launch import _LAUNCHERS
+    assert any(kk[0] == "fla_recurrent_decode" for kk in _LAUNCHERS), \
+        "FLA 预绑定启动器未被使用（可能触发了回退）"
+
+    # 非连续 g/beta（模拟 in_proj_ba 的 [b|a] 半区视图）必须回退而不是算错
+    ba = torch.randn(B, 1, 2 * nv, device=DEVICE)
+    g_nc, beta_nc = ba[..., :nv], ba[..., nv:]
+    assert not g_nc.is_contiguous() and not beta_nc.is_contiguous()
+    hit = []
+
+    def fallback():
+        hit.append(1)
+        return fused_recurrent_gated_delta_rule(
+            q, k, v, g=g_nc, beta=beta_nc,
+            initial_state=h0, output_final_state=True, use_qk_l2norm_in_kernel=True)
+
+    out_nc, state_nc = fla_recurrent_decode(q, k, v, g_nc, beta_nc, h0,
+                                            fallback=fallback)
+    assert hit, "非连续输入没有回退到公开 API"
+    ref_nc = fused_recurrent_gated_delta_rule(
+        q, k, v, g=g_nc.contiguous(), beta=beta_nc.contiguous(),
+        initial_state=h0, output_final_state=True, use_qk_l2norm_in_kernel=True)
+    assert_close(out_nc, ref_nc[0], 1e-6, "回退路径输出")
+
+
+def test_pool_decode_matches_gather_path():
+    """池内原地读写的 recurrent 内核 vs gather + FLA 路径：输出与池内容都要一致。"""
+    if not _require_cuda("test_pool_decode_matches_gather_path"):
+        return
+    torch.manual_seed(23)
+    B, nk, nv, kd, vd = 4, 2, 4, 8, 6
+    SLOTS, LAYERS = 6, 3
+    q = torch.randn(B, 1, nk, kd, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(B, 1, nk, kd, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(B, 1, nv, vd, device=DEVICE, dtype=torch.bfloat16)
+    g = -torch.rand(B, 1, nv, device=DEVICE).abs() * 0.5
+    beta = torch.sigmoid(torch.randn(B, 1, nv, device=DEVICE, dtype=torch.bfloat16))
+    pool0 = torch.randn(SLOTS, LAYERS, nv, kd, vd, device=DEVICE)
+    slots = torch.tensor([0, 3, 4, 5], dtype=torch.int32, device=DEVICE)
+
+    # 逐个层下标验证：必须**逐位**相等（layer_offset 写错时只会在 li != 1 暴露）
+    for li in (0, 1, 2):
+        pool_ref = pool0.clone()
+        rec = pool_ref[slots.long(), li]
+        out_ref, new_rec = fused_recurrent_gated_delta_rule(
+            q, k, v, g=g, beta=beta, initial_state=rec, output_final_state=True,
+            use_qk_l2norm_in_kernel=True)
+        pool_ref[slots.long(), li] = new_rec
+
+        pool_fused = pool0.clone()
+        out = gdn_recurrent_pool_decode(q, k, v, g, beta, pool_fused, slots, li)
+
+        assert out.shape == out_ref.shape
+        assert torch.equal(out.reshape_as(out_ref), out_ref), \
+            f"li={li}: 池内 recurrent 输出与原路径不是逐位相等"
+        assert torch.equal(pool_fused[slots.long(), li], pool_ref[slots.long(), li]), \
+            f"li={li}: 池内状态更新与原路径不是逐位相等"
+        # 其它层、其它槽位都不能被写坏
+        others = [l for l in range(LAYERS) if l != li]
+        assert torch.equal(pool_fused[:, others], pool0[:, others]), \
+            f"li={li}: 其它层被写坏"
+        unused = [i for i in range(SLOTS) if i not in slots.tolist()]
+        assert torch.equal(pool_fused[unused], pool0[unused]), \
+            f"li={li}: 未使用的槽位被写坏"
+
+    from nanovllm.layers.triton_launch import _LAUNCHERS
+    assert any(kk[0] == "gdn_rec_pool" for kk in _LAUNCHERS), \
+        "池内 recurrent 内核未被使用"
+
+
+def test_bound_launch_arg_alignment():
+    """预绑定启动器的位置参数必须与 Triton 内核签名逐一对齐（无需 GPU）。
+
+    Triton 按"签名下标"取位置参数，并把 None / int(1) 特化成 constexpr；
+    参数一旦错位不会报错，只会静默算错 —— 而预绑定恰好绕开了 binder 的参数
+    校验。这里把 bound_launch 换成记录器，再用 Triton 自己的特化函数核对
+    每个 (kernel, args, constexprs) 组合，把这“无 GPU 也测不到”的风险锁住。
+    """
+    from triton.runtime.jit import native_specialize_impl
+    from nanovllm.layers import gated_delta_net as gdn_mod
+    from nanovllm.layers import layernorm as ln_mod
+    from nanovllm.layers import triton_launch as tl_mod
+
+    recorded = []
+
+    class _StubRunner:
+        def __call__(self, *a):
+            pass
+
+    def recorder(jit_fn, tag, key, grid, *args, constexprs, num_warps, num_stages=3):
+        recorded.append((tag, jit_fn, args, dict(constexprs)))
+        return _StubRunner(), args
+
+    class _StubBackend:
+        def get_tensor_specialization(self, *a, **kw):
+            t = a[0]
+            ty = str(t.dtype).replace("torch.", "")
+            ok = all(s % 16 == 0 for s in t.stride()) and t.data_ptr() % 16 == 0
+            return ("*" + ty, "D" if ok else "N")
+
+    saved = (tl_mod.bound_launch, ln_mod.bound_launch, gdn_mod.bound_launch)
+    tl_mod.bound_launch = recorder
+    ln_mod.bound_launch = recorder
+    gdn_mod.bound_launch = recorder
+    try:
+        x = torch.randn(16, 64, dtype=torch.bfloat16)
+        w = torch.zeros(64, dtype=torch.bfloat16)
+        gate = torch.randn(16, 64, dtype=torch.bfloat16)
+        ln_mod.rms_norm(x, w, 1e-6, zero_centered=True)
+        ln_mod.rms_norm_gated(x, w, gate, 1e-6)
+
+        B, key_dim, value_dim, K = 3, 8, 16, 4
+        conv_dim = 2 * key_dim + value_dim
+        xs = torch.randn(B, conv_dim, dtype=torch.bfloat16)
+        query = torch.empty(B, 1, key_dim, dtype=torch.bfloat16)
+        key = torch.empty(B, 1, key_dim, dtype=torch.bfloat16)
+        value = torch.empty(B, 1, value_dim, dtype=torch.bfloat16)
+        for bias in (None, torch.randn(conv_dim)):
+            gdn_mod._conv_update_split_fused(
+                xs, torch.randn(conv_dim, K), bias,
+                torch.zeros(B, conv_dim, K - 1), query, key, value,
+                key_dim, value_dim, K, True)
+
+        b, nk, nv, kd, vd = 2, 2, 4, 8, 6
+        ba = torch.randn(b, 1, 2 * nv, dtype=torch.bfloat16)
+        gdn_mod.gdn_gate(ba, torch.randn(nv), torch.randn(nv))
+        gdn_mod.fla_recurrent_decode(
+            torch.randn(b, 1, nk, kd, dtype=torch.bfloat16),
+            torch.randn(b, 1, nk, kd, dtype=torch.bfloat16),
+            torch.randn(b, 1, nv, vd, dtype=torch.bfloat16),
+            -torch.rand(b, 1, nv).abs(), torch.rand(b, 1, nv),
+            torch.zeros(b, nv, kd, vd), fallback=lambda: None)
+    finally:
+        tl_mod.bound_launch, ln_mod.bound_launch, gdn_mod.bound_launch = saved
+
+    # rms_norm / rms_norm_gated / gdn_gate / 融合 conv ×2 / FLA recurrent
+    assert len(recorded) == 6, f"记录到的启动次数不对: {len(recorded)}"
+    for tag, jit_fn, args, constexprs in recorded:
+        base = jit_fn
+        while not hasattr(base, "params"):
+            base = base.fn
+        assert len(args) <= len(base.params), f"{tag}: 位置参数多于形参"
+        for i, p in enumerate(base.params):
+            if i < len(args):
+                assert not p.is_constexpr, \
+                    f"{tag}: pos {i} ({p.name}) 是 tl.constexpr 却在位置参数里"
+                spec = native_specialize_impl(
+                    _StubBackend(), args[i], bool(getattr(p, "is_const", False)),
+                    not bool(getattr(p, "do_not_specialize", False)),
+                    not bool(getattr(p, "do_not_specialize_on_alignment", False)))
+                if spec[0] == "constexpr":
+                    # None 占位是预期的；其它值被隐式 constexpr 会成为特化隐患
+                    assert args[i] is None, \
+                        f"{tag}: pos {i} ({p.name}) 意外被特化成 constexpr: {args[i]!r}"
+            else:
+                assert p.is_constexpr or p.name in constexprs, \
+                    f"{tag}: pos {i} ({p.name}) 缺少实参"
 
 
 if __name__ == "__main__":

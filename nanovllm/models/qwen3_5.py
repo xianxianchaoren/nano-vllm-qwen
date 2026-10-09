@@ -211,20 +211,25 @@ class Qwen3_5Model(nn.Module):
 
         状态按 seq_slots 在 GPU 上 gather / scatter，全程无 host 同步、无 Python 循环，
         对应 vLLM 的批量 GDN decode 内核。
+
+        循环状态（recurrent_state）不再 gather/scatter，而是由内核**直接在状态池里
+        原地读写**（对应 vLLM 的 packed decode kernel），省掉每层每步 2×33MB 搬运；
+        conv 状态量很小（每层 786KB），仍走 gather/scatter。
         """
         slots = seq_slots.long()                                   # (B,)
         conv_state = self.conv_pool[slots, li]                     # (B, C, K-1)
-        rec_state = self.rec_pool[slots, li]                       # (B, V, Kd, Vd)
         o, new_conv, new_rec = layer.linear_attn(
-            x_normed.unsqueeze(1), conv_state, rec_state)          # (B, 1, D)
+            x_normed.unsqueeze(1), conv_state, None,               # (B, 1, D)
+            rec_pool=self.rec_pool, rec_slots=seq_slots, rec_layer=li)
         # GDN 内核内部按 float32 计算，返回的循环状态是 float32；状态池是模型 dtype
         # （bf16）。高级索引 scatter 要求 dtype 严格一致，这里显式转型。
         if new_conv.dtype != self.conv_pool.dtype:
             new_conv = new_conv.to(self.conv_pool.dtype)
-        if new_rec.dtype != self.rec_pool.dtype:
-            new_rec = new_rec.to(self.rec_pool.dtype)
         self.conv_pool[slots, li] = new_conv
-        self.rec_pool[slots, li] = new_rec
+        if new_rec is not None:      # 池内融合路径下状态已就地更新，无需再搬运
+            if new_rec.dtype != self.rec_pool.dtype:
+                new_rec = new_rec.to(self.rec_pool.dtype)
+            self.rec_pool[slots, li] = new_rec
         return o.squeeze(1)
 
     def _apply_linear_mixer_prefill(self, layer, x_normed, li, cu_seqlens, slots):

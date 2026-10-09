@@ -2,7 +2,8 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
-from functools import lru_cache
+
+from nanovllm.layers.triton_launch import block_n, bound_launch
 
 
 @triton.jit
@@ -33,49 +34,15 @@ def _rms_norm_gated_kernel(
     tl.store(Y + cols, y, mask=mask)
 
 
-# ----------------------------------------------------------------------
-# Triton 启动器缓存
-# ----------------------------------------------------------------------
-# Triton 的 `jit_fn[grid](**kwargs)` 每次调用都要走 binder：解析 kwargs、
-# 计算特化 key、查编译缓存，实测 ~16us/次；再加上包装层的 shape/stride 计算与
-# 分配，一次 norm 调用要 ~43us。这里把「编译产物 + 预绑定启动器」按
-# (shape, dtype, stride, constexpr) 缓存下来，命中后只做一次函数调用
-# （~9us）。Qwen3.5 每步有 ~65 次 norm + ~24 次 gated norm，收益可观。
-_LAUNCHERS: dict = {}
-
-
-@lru_cache(maxsize=None)
-def _block_n(n: int, element_size: int) -> int:
-    """每行一个 program 时覆盖一行所需的 2 次幂宽度（受 shared memory 限制）。"""
-    return min(65536 // element_size, triton.next_power_of_2(n))
-
-
-def _launch(jit_fn, tag, key, grid, *args, constexprs, num_warps, num_stages=3):
-    """返回 (预绑定启动器, 位置参数元组)；未命中缓存时先编译。
-
-    Args:
-        args: 必须与 kernel 形参顺序严格一致（constexpr 参数除外）
-        key: 必须覆盖所有影响特化的信息（shape / dtype / stride / constexpr / num_warps）
-    """
-    cache_key = (tag,) + tuple(key)
-    runner = _LAUNCHERS.get(cache_key)
-    if runner is None:
-        compiled = jit_fn.warmup(*args, **constexprs, num_warps=num_warps,
-                                 num_stages=num_stages, grid=grid)
-        runner = compiled[(grid[0], grid[1] if len(grid) > 1 else 1, 1)]
-        _LAUNCHERS[cache_key] = runner
-    return runner, args
-
-
 def rms_norm_gated(x: torch.Tensor, weight: torch.Tensor, gate: torch.Tensor, eps: float):
     """走融合 Triton 内核的 RMSNormGated（要求 CUDA + 最后一维连续）。"""
     x2 = x.reshape(-1, x.shape[-1])
     gate2 = gate.reshape(-1, gate.shape[-1])
     out = torch.empty_like(x2)
     M, N = x2.shape
-    BLOCK_N = _block_n(N, x2.element_size())
+    BLOCK_N = block_n(N, x2.element_size())
     rstd = torch.empty(M, dtype=torch.float32, device=x2.device)
-    runner, args = _launch(
+    runner, args = bound_launch(
         _rms_norm_gated_kernel, "gated",
         (M, N, x2.dtype, gate2.dtype, weight.dtype,
          x2.stride(0), out.stride(0), gate2.stride(0), BLOCK_N),
@@ -124,9 +91,9 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered: b
     x2 = x.reshape(-1, x.shape[-1])
     out = torch.empty_like(x2)
     M, N = x2.shape
-    BLOCK_N = _block_n(N, x2.element_size())
+    BLOCK_N = block_n(N, x2.element_size())
     num_warps = min(max(BLOCK_N // 512, 1), 8)
-    runner, args = _launch(
+    runner, args = bound_launch(
         _rms_norm_kernel, "rms",
         (M, N, x2.dtype, weight.dtype, x2.stride(0), out.stride(0),
          BLOCK_N, zero_centered, num_warps),

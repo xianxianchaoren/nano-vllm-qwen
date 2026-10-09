@@ -37,6 +37,8 @@ delta rule 内核直接使用 FLA（flash-linear-attention）的 Triton 实现�
 """
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -44,8 +46,18 @@ import triton
 import triton.language as tl
 
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.ops.utils.op import exp as _fla_exp
+
+try:
+    # FLA recurrent 内核本体（用于预绑定启动器，省掉每次调用的 binder 开销）
+    from fla.ops.gated_delta_rule.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_fwd_kernel,
+    )
+except ImportError:   # pragma: no cover - 兼容内核改名/搬迁的 FLA 版本
+    fused_recurrent_gated_delta_rule_fwd_kernel = None
 
 from nanovllm.layers.layernorm import RMSNormGated
+from nanovllm.layers.triton_launch import bound_launch
 
 
 # ======================================================================
@@ -89,17 +101,28 @@ def _gdn_gate_kernel(
 def gdn_gate(ba: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor):
     """融合门控：返回 (beta, g)，形状均与 ba 的前半部分相同 (..., H)。
 
-    beta 为输入 dtype，g 为 float32。
+    beta 为输入 dtype，g 为 float32（log 空间，∈ (−∞, 0]）。
+
+    产物是**新分配且连续**的张量 —— 这一点很重要：ba 的 [b|a] 两个半区都是行
+    stride = 2H 的非连续视图，而 FLA 的 recurrent 内核读 g/beta 时写死了行内
+    布局、没有 stride 入参，必须喂给它连续的张量。
     """
     *lead, two_h = ba.shape
     H = two_h // 2
     ba2 = ba.reshape(-1, two_h)
-    total = ba2.shape[0] * H
-    beta = torch.empty((ba2.shape[0], H), dtype=ba.dtype, device=ba.device)
-    g = torch.empty((ba2.shape[0], H), dtype=torch.float32, device=ba.device)
+    rows = ba2.shape[0]
+    total = rows * H
+    beta = torch.empty((rows, H), dtype=ba.dtype, device=ba.device)
+    g = torch.empty((rows, H), dtype=torch.float32, device=ba.device)
     BLOCK = 256
-    _gdn_gate_kernel[(triton.cdiv(total, BLOCK),)](
-        ba2, a_log, dt_bias, g, beta, total, H=H, BLOCK=BLOCK, num_warps=4)
+    runner, args = bound_launch(
+        _gdn_gate_kernel, "gdn_gate",
+        (rows, total, H, BLOCK, ba.dtype, a_log.dtype, dt_bias.dtype),
+        (triton.cdiv(total, BLOCK),),
+        ba2, a_log, dt_bias, g, beta, total,
+        constexprs=dict(H=H, BLOCK=BLOCK), num_warps=4,
+    )
+    runner(*args)
     return beta.reshape(*lead, H), g.reshape(*lead, H)
 
 
@@ -185,6 +208,151 @@ def causal_conv1d_update(
     return out.to(hidden_states.dtype)
 
 
+@triton.jit
+def _causal_conv1d_update_split_kernel(
+    x_ptr, w_ptr, bias_ptr, state_ptr,
+    q_ptr, k_ptr, v_ptr,
+    stride_xb, stride_sb, stride_qb, stride_kb, stride_vb,
+    state_len,
+    KEY_DIM: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    ACTIVATE: tl.constexpr,
+):
+    """decode 单步融合内核：因果状态移位 + depthwise 卷积 + 激活 + 按 q/k/v 分段写出。
+
+    每个 program 处理一个 batch 上的一段通道：
+
+    1. 卷积窗口 = conv_state 的最后 K-1 项 + 当前输入（因果性由"只取历史末尾"保证，
+       等价于先 cat 再 padding=0 卷积取最后一个输出位置）；
+    2. 输出按通道归属分别写进 q / k / v 三块独立缓冲区 —— 因此产物天然连续，
+       下游 FLA 内核不再需要对 split 出来的 q/k/v 做 `.contiguous()` 拷贝
+       （通道布局是连续的 [q | k | v]，所以每段都在同一个 program 内）；
+    3. conv_state 原地左移一位，末端写入当前输入（与参考实现的
+       `conv_state.copy_(hidden_new[..., -state_len:])` 一致）。
+
+    相比 torch 参考实现（`torch.cat` + `F.conv1d` + `F.silu` + `copy_` 共 4 次
+    算子派发），这里只发一次 kernel。
+    """
+    pid_c = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    total = 2 * KEY_DIM + VALUE_DIM
+    mask = offs < total
+
+    # ---- 1) 卷积：先算当前输入项，再累加 state 的最近 K-1 项 ----
+    xn = tl.load(x_ptr + pid_b * stride_xb + offs, mask=mask, other=0.0).to(tl.float32)
+    base_s = pid_b * stride_sb + offs * state_len
+    acc = xn * tl.load(w_ptr + offs * K + (K - 1), mask=mask, other=0.0).to(tl.float32)
+    for j in tl.static_range(K - 1):
+        col = state_len - (K - 1) + j
+        sv = tl.load(state_ptr + base_s + col, mask=mask, other=0.0).to(tl.float32)
+        wj = tl.load(w_ptr + offs * K + j, mask=mask, other=0.0).to(tl.float32)
+        acc += wj * sv
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    if ACTIVATE:
+        acc = acc * tl.sigmoid(acc)          # silu
+
+    # ---- 2) 分三段写出（q / k / v 各自连续）----
+    tl.store(q_ptr + pid_b * stride_qb + offs, acc,
+             mask=mask & (offs < KEY_DIM))
+    tl.store(k_ptr + pid_b * stride_kb + (offs - KEY_DIM), acc,
+             mask=mask & (offs >= KEY_DIM) & (offs < 2 * KEY_DIM))
+    tl.store(v_ptr + pid_b * stride_vb + (offs - 2 * KEY_DIM), acc,
+             mask=mask & (offs >= 2 * KEY_DIM))
+
+    # ---- 3) 状态左移一位：new_state[j] = old[j+1]，末位写当前输入 ----
+    ks = tl.arange(0, BLOCK_K)
+    shifted = tl.load(state_ptr + base_s[:, None] + (ks + 1)[None, :],
+                      mask=mask[:, None] & ((ks + 1) < state_len)[None, :], other=0.0)
+    new_s = tl.where((ks == state_len - 1)[None, :], xn[:, None], shifted)
+    tl.store(state_ptr + base_s[:, None] + ks[None, :], new_s,
+             mask=mask[:, None] & (ks < state_len)[None, :])
+
+
+def causal_conv1d_update_split(
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    key_dim: int,
+    activation: str = "silu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """decode 单步：融合 conv 更新，并直接把 [q|k|v] 三段写成三块连续缓冲区。
+
+    返回 (query, key, value)，形状均为 (B, 1, dim)；`conv_state` 被原地更新。
+
+    走融合内核的条件（不满足则退回逐算子实现，保证 CPU / 非标准场景可用）：
+        - CUDA + 最后一维连续 + `state_len == K - 1`（单步增量卷积的前提）
+    """
+    batch, conv_dim, seq_len = hidden_states.shape
+    state_len = conv_state.shape[-1]
+    kernel_size = weight.shape[-1]
+    value_dim = conv_dim - 2 * key_dim
+    # 通道步长要看二维视图：输入是 (B, C, 1)，转置后末维 size=1、stride 并不为 1
+    x = hidden_states[:, :, 0]                        # (B, C)
+    fused = (
+        seq_len == 1
+        and hidden_states.is_cuda
+        and x.stride(-1) == 1
+        and state_len == kernel_size - 1
+        and conv_state.is_contiguous()
+        and weight.is_contiguous()
+        and (bias is None or bias.is_contiguous())
+        and key_dim > 0 and value_dim > 0
+    )
+    if not fused:
+        out = causal_conv1d_update(hidden_states, conv_state, weight, bias, activation)
+        # (B, C, L) -> (B, L, C) 后再按通道切段，保证与融合路径同样的输出布局
+        return torch.split(out.transpose(1, 2), [key_dim, key_dim, value_dim], dim=-1)
+
+    dtype, device = hidden_states.dtype, hidden_states.device
+    query = torch.empty(batch, 1, key_dim, dtype=dtype, device=device)
+    key = torch.empty(batch, 1, key_dim, dtype=dtype, device=device)
+    value = torch.empty(batch, 1, value_dim, dtype=dtype, device=device)
+    _conv_update_split_fused(x, weight, bias, conv_state, query, key, value,
+                             key_dim, value_dim, kernel_size,
+                             activate=activation == "silu")
+    return query, key, value
+
+
+def _conv_update_split_fused(x, weight, bias, conv_state, query, key, value,
+                             key_dim, value_dim, kernel_size, activate):
+    """实际发射融合 conv 内核（调用方已完成连续性/形状校验）。
+
+    单独拆出来是为了让参数顺序能在无 GPU 环境下做静态校验
+    （见 tests/test_gdn.py 与 tools 校验脚本）。
+    """
+    batch = x.shape[0]
+    conv_dim = 2 * key_dim + value_dim
+    state_len = kernel_size - 1
+    dtype = x.dtype
+    BLOCK_C = 128
+    BLOCK_K = triton.next_power_of_2(state_len)
+    grid = (triton.cdiv(conv_dim, BLOCK_C), batch)
+    runner, args = bound_launch(
+        _causal_conv1d_update_split_kernel, "conv_update_split",
+        (batch, conv_dim, key_dim, value_dim, kernel_size, state_len,
+         BLOCK_C, BLOCK_K, dtype, x.stride(0), conv_state.stride(0),
+         query.stride(0), key.stride(0), value.stride(0),
+         bias is not None, activate),
+        grid,
+        x, weight, bias, conv_state, query, key, value,
+        x.stride(0), conv_state.stride(0),
+        query.stride(0), key.stride(0), value.stride(0),
+        state_len,
+        constexprs=dict(KEY_DIM=key_dim, VALUE_DIM=value_dim, K=kernel_size,
+                        BLOCK_C=BLOCK_C, BLOCK_K=BLOCK_K,
+                        HAS_BIAS=bias is not None, ACTIVATE=activate),
+        num_warps=4,
+    )
+    runner(*args)
+
+
 def causal_conv1d_varlen(hidden_states, weight, bias=None, activation="silu", cu_seqlens=None):
     """多序列拼接（flat）张量上的 depthwise 因果卷积。
 
@@ -250,6 +418,179 @@ def varlen_conv_state(conv_input, cu_seqlens, pad):
     gathered = conv_input[0][:, idx.clamp(min=0).reshape(-1)].reshape(C, ends.numel(), pad)
     gathered = gathered * valid.unsqueeze(0)
     return gathered.permute(1, 0, 2).contiguous()
+
+
+# ======================================================================
+# FLA recurrent 内核的预绑定启动器（decode 单步专用）
+# ======================================================================
+# `fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule` 每次调用要穿过
+# autograd.Function、input_guard（对约 20 个入参逐个 .contiguous()）、Heuristics
+# 的 lambda 求值，最后才是 Triton binder；实测 ~141us/次，而 decode 每步有 24 个
+# GDN 层，单这一项就吃掉 ~3.4ms/step。这里用同一个 kernel、同一组 constexpr 直接
+# 预绑定（数值完全等价），只省掉 Python 包装。
+_FLA_RECURRENT_CONSTEXPRS = dict(
+    USE_G=True, USE_GK=False, USE_GV=False,
+    USE_QK_L2NORM_IN_KERNEL=True, IS_BETA_HEADWISE=True,
+    USE_INITIAL_STATE=True, STORE_FINAL_STATE=True,
+    STATE_V_FIRST=False, IS_VARLEN=False,
+    # 门控由 gdn_gate 预先算好（g 为 log 空间 fp32、beta 已过 sigmoid）：
+    # 这样喂给内核的是连续张量，绕开了 [b|a] 半区非连续的问题。
+    USE_GATE_IN_KERNEL=False, HAS_DT_BIAS=False,
+    APPLY_BETA_SIGMOID=False, ALLOW_NEG_EIGVAL=False,
+)
+
+_FLA_FALLBACK_WARNED = False
+
+
+@triton.jit
+def _gdn_recurrent_pool_decode_kernel(
+    q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, o_ptr,
+    state_ptr, slot_ptr,
+    layer_stride, slot_stride, scale,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BK: tl.constexpr, BV: tl.constexpr,
+):
+    """单步（T=1）recurrent delta rule，循环状态**直接在池里原地读写**。
+
+    与 FLA 的 `fused_recurrent_gated_delta_rule_fwd_kernel` 逐行等价：同样的
+    QK L2 归一化顺序、同样的 `b_h *= exp(g)` 衰减、同样的写入/读出公式，
+    只有两处不同：
+      1. 初始状态按 (slot_ptr[i_n], layer) 直接寻址，最终状态**原地写回**同一位置
+         —— 省掉 gather + scatter 两次 33MB（每层每步）的状态搬运；
+      2. 只做 T=1，去掉时间循环与 varlen / 多门控分支（decode 专用）。
+    """
+    i_v = tl.program_id(0)
+    i_nh = tl.program_id(1)
+    i_n = i_nh // HV
+    i_hv = i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    slot_id = tl.load(slot_ptr + i_n)
+    p_state = state_ptr + slot_id * slot_stride + layer_stride + i_hv * K * V
+
+    p_q = q_ptr + (i_n * H + i_h) * K + o_k
+    p_k = k_ptr + (i_n * H + i_h) * K + o_k
+    p_v = v_ptr + (i_n * HV + i_hv) * V + o_v
+    p_g = g_ptr + i_n * HV + i_hv
+    p_beta = beta_ptr + i_n * HV + i_hv
+    p_o = o_ptr + (i_n * HV + i_hv) * V + o_v
+
+    b_h = tl.load(p_state + o_k[:, None] * V + o_v[None, :],
+                  mask=mask_h, other=0.0).to(tl.float32)
+    b_q = tl.load(p_q, mask=mask_k, other=0.0).to(tl.float32)
+    b_k = tl.load(p_k, mask=mask_k, other=0.0).to(tl.float32)
+    b_v = tl.load(p_v, mask=mask_v, other=0.0).to(tl.float32)
+    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    b_q = b_q * scale
+    b_beta = tl.load(p_beta).to(tl.float32)
+    b_g = tl.load(p_g).to(tl.float32)
+    b_h *= _fla_exp(b_g)
+    b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+    b_h += b_k[:, None] * b_v
+    b_o = tl.sum(b_h * b_q[:, None], 0)
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+    tl.store(p_state + o_k[:, None] * V + o_v[None, :],
+             b_h.to(p_state.dtype.element_ty), mask=mask_h)
+
+
+def gdn_recurrent_pool_decode(query, key, value, g, beta, rec_pool, slots, layer_idx):
+    """decode 单步的 recurrent delta rule，状态直接在 `rec_pool` 里原地读写。
+
+    Args:
+        query/key: (B, 1, num_k_heads, head_k_dim) 连续
+        value:     (B, 1, num_v_heads, head_v_dim) 连续
+        g:         (B, 1, num_v_heads) float32，log 空间衰减
+        beta:      (B, 1, num_v_heads)，已过 sigmoid
+        rec_pool:  (num_slots, num_layers, num_v_heads, head_k_dim, head_v_dim) fp32 连续
+        slots:     (B,) int32/int64，每个 batch 元素对应的池槽位
+        layer_idx: 该 GDN 层在池里的层下标（int）
+
+    返回 (B, 1, num_v_heads, head_v_dim) 的输出；`rec_pool` 对应行被原地更新。
+    """
+    batch, seq_len, num_k_heads, head_k_dim = key.shape
+    num_v_heads, head_v_dim = value.shape[2], value.shape[-1]
+    BK = triton.next_power_of_2(head_k_dim)
+    BV = min(8, triton.next_power_of_2(head_v_dim))
+    scale = head_k_dim ** -0.5
+    out = torch.empty(batch, 1, num_v_heads, head_v_dim,
+                      dtype=value.dtype, device=value.device)
+    grid = (triton.cdiv(head_v_dim, BV), batch * num_v_heads)
+    layer_offset = int(layer_idx) * rec_pool.stride(1)   # 该层在池里的绝对偏移
+    runner, args = bound_launch(
+        _gdn_recurrent_pool_decode_kernel, "gdn_rec_pool",
+        (batch, num_k_heads, num_v_heads, head_k_dim, head_v_dim, BK, BV,
+         value.dtype, g.dtype, beta.dtype, rec_pool.dtype, slots.dtype,
+         rec_pool.stride(0), layer_offset),
+        grid,
+        query, key, value, g, beta, out,
+        rec_pool, slots, layer_offset, rec_pool.stride(0), scale,
+        constexprs=dict(H=num_k_heads, HV=num_v_heads, K=head_k_dim, V=head_v_dim,
+                        BK=BK, BV=BV),
+        num_warps=1,
+    )
+    runner(*args)
+    return out
+
+
+def fla_recurrent_decode(
+    query: torch.Tensor,          # (B, 1, num_k_heads, head_k_dim)
+    key: torch.Tensor,
+    value: torch.Tensor,          # (B, 1, num_v_heads, head_v_dim)
+    g: torch.Tensor,              # (B, 1, num_v_heads) log 空间衰减，float32
+    beta: torch.Tensor,           # (B, 1, num_v_heads) 已过 sigmoid
+    initial_state: torch.Tensor,  # (B, num_v_heads, head_k_dim, head_v_dim) fp32
+    fallback,                     # () -> (out, final_state)，即公开 API 的调用
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """decode 单步的 recurrent delta rule（预绑定启动器；不可用时回退公开 API）。
+
+    与 `fused_recurrent_gated_delta_rule(..., use_qk_l2norm_in_kernel=True)`
+    """
+    global _FLA_FALLBACK_WARNED
+    if fused_recurrent_gated_delta_rule_fwd_kernel is None:
+        return fallback()
+    # 内核没有 stride 入参（q/k/v/g/beta/h0 全按连续布局寻址）。预绑定绕开了
+    # 公开 API 里 input_guard 的 .contiguous()，所以这里必须自己确认，
+    # 非连续时交回公开 API 去拷贝，绝不能带着错误布局发射。
+    if not (query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
+            and g.is_contiguous() and beta.is_contiguous()
+            and initial_state.is_contiguous()):
+        return fallback()
+    try:
+        batch, seq_len, num_k_heads, head_k_dim = key.shape
+        num_v_heads, head_v_dim = value.shape[2], value.shape[-1]
+        BK = triton.next_power_of_2(head_k_dim)
+        BV = min(8, triton.next_power_of_2(head_v_dim))
+        scale = head_k_dim ** -0.5
+        out = torch.empty_like(value)
+        final_state = query.new_empty(batch, num_v_heads, head_k_dim, head_v_dim,
+                                      dtype=torch.float32)
+        grid = (triton.cdiv(head_v_dim, BV), batch * num_v_heads)
+        runner, args = bound_launch(
+            fused_recurrent_gated_delta_rule_fwd_kernel, "fla_recurrent_decode",
+            (batch, seq_len, num_k_heads, num_v_heads, head_k_dim, head_v_dim, BK, BV,
+             query.dtype, value.dtype, g.dtype, beta.dtype,
+             initial_state.dtype, scale),
+            grid,
+            query, key, value, g, None, None, beta, None, None,
+            out, initial_state, final_state, None, scale, seq_len,
+            constexprs=dict(H=num_k_heads, HV=num_v_heads, K=head_k_dim, V=head_v_dim,
+                            BK=BK, BV=BV, **_FLA_RECURRENT_CONSTEXPRS),
+            num_warps=1,
+        )
+    except Exception as exc:      # pragma: no cover - 依赖 FLA/Triton 内部实现
+        if not _FLA_FALLBACK_WARNED:
+            _FLA_FALLBACK_WARNED = True
+            warnings.warn(f"FLA 预绑定启动器不可用，回退到公开 API：{exc!r}")
+        return fallback()
+    runner(*args)
+    return out, final_state
 
 
 # ======================================================================
@@ -371,13 +712,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_state: torch.Tensor | None = None,                               # (B, C, K-1)
         recurrent_state: torch.Tensor | None = None,                          # (B, V, Kd, Vd)
         cu_seqlens: torch.Tensor | None = None,                               # (S+1,) varlen 拼接边界
+        rec_pool: torch.Tensor | None = None,                                 # (S, L, V, Kd, Vd)
+        rec_slots: torch.Tensor | None = None,                                # (B,) 池槽位
+        rec_layer: int | None = None,                                         # 本层在池里的层下标
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """前向：返回 (输出, 新的 conv_state, 新的 recurrent_state)。
 
         三种模式：
         - varlen prefill（cu_seqlens 非空）：多序列首尾相接，conv 与 chunk 内核各一次算完
-        - decode（L == 1 且带 conv_state）：conv 增量 + recurrent 内核
+        - decode（L == 1 且带 conv_state）：融合 conv 增量内核（状态移位 + 卷积 +
+          激活 + 按 q/k/v 分段写出）+ 预绑定启动器的 recurrent 内核
         - 普通 prefill（L > 1）：conv 全量 + chunk 内核
+
+        decode 时若给了 rec_pool/rec_slots/rec_layer，recurrent 那一步会走
+        「池内原地读写」的融合内核（省掉 gather + scatter），此时返回的
+        new_recurrent_state 为 None（状态已在池里更新完毕）。
         """
         batch, seq_len, _ = hidden_states.shape
         varlen = cu_seqlens is not None
@@ -392,14 +741,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(batch, seq_len, -1, self.head_v_dim)
         ba = self.in_proj_ba(hidden_states)
         # 门控参数：β ∈ (0,1)；g ∈ (−∞, 0]（log 空间）。
-        # decode 单步直接把原始 ba 交给 FLA 的 recurrent 内核，由内核内部完成
-        # sigmoid(b) 与 -exp(A)·softplus(a + dt_bias)（对应 vLLM 融合门控的 decode
-        # 路径），省掉一次独立 kernel 及其张量分配；chunk 内核不支持融合门控，
-        # prefill 仍用下面的融合 Triton kernel 预先算好（替代原先 ~8 个逐元素 kernel）。
-        if is_step_decode:
-            b_raw, a_raw = ba.split(self.num_v_heads, dim=-1)
-            beta = g = None
-        elif ba.is_cuda and ba.stride(-1) == 1 and ba.dtype in (torch.bfloat16, torch.float16):
+        # 融合成一个 Triton kernel（对应 vLLM 的 fused gating），替代原先
+        # sigmoid / cast / add-bias / softplus / exp(A_log) / mul / neg 等 ~8 个
+        # 逐元素 kernel；CPU 或非连续输入走参考实现。
+        #
+        # 为什么 decode 也用这个 kernel 而不是让 FLA 内核内部算门控：
+        # 内核内的门控要求把 ba 的 [b|a] 两个半区分别喂进去，而它们是行 stride = 2H
+        # 的**非连续视图**（FLA 内核没有 stride 入参）—— 公开 API 靠 input_guard 的
+        # .contiguous() 掩盖了这一点，预绑定路径没有那层包装，会静默读错 batch 维。
+        # gdn_gate 产出连续的 beta / g，既正确又只多一次很便宜的小 kernel。
+        if ba.is_cuda and ba.stride(-1) == 1 and ba.dtype in (torch.bfloat16, torch.float16):
             beta, g = gdn_gate(ba, self.A_log, self.dt_bias)
         else:
             beta, g = gdn_gate_native(ba, self.A_log, self.dt_bias)
@@ -408,26 +759,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_weight = self.conv1d.weight.squeeze(1)
         if varlen:
             conv_input = mixed_qkv
-            mixed_qkv = causal_conv1d_varlen(
+            mixed_out = causal_conv1d_varlen(
                 conv_input, conv_weight, self.conv1d.bias, activation="silu",
                 cu_seqlens=cu_seqlens)
             new_conv_state = varlen_conv_state(
                 conv_input, cu_seqlens, self.conv_kernel_size - 1)
-        elif conv_state is not None and seq_len == 1:
-            # decode 单步：拼上历史 → 一次无 padding 卷积，同时原地更新 state
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv, conv_state, conv_weight, self.conv1d.bias, "silu")
+            query, key, value = torch.split(
+                mixed_out.transpose(1, 2),
+                [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        elif is_step_decode:
+            # decode 单步：一次融合 kernel 完成"状态移位 + 卷积 + 激活"，并把
+            # [q|k|v] 三段分别写成连续缓冲区，省掉 split 后 q/k/v 各一次 contiguous 拷贝
+            query, key, value = causal_conv1d_update_split(
+                mixed_qkv, conv_state, conv_weight, self.conv1d.bias,
+                self.key_dim, "silu")
             new_conv_state = conv_state
         else:
             # prefill 全量：一次算完，并导出最近 K-1 个输入作为后续 decode 的起点
-            mixed_qkv, new_conv_state = causal_conv1d_fn(
+            mixed_out, new_conv_state = causal_conv1d_fn(
                 mixed_qkv, conv_weight, self.conv1d.bias,
                 activation="silu", return_state=True)
-        mixed_qkv = mixed_qkv.transpose(1, 2)                             # 回到 (B, L, C)
+            query, key, value = torch.split(
+                mixed_out.transpose(1, 2),
+                [self.key_dim, self.key_dim, self.value_dim], dim=-1)
 
-        # 3) 拆分 q/k/v（连续布局）
-        query, key, value = torch.split(
-            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        # 3) 拆成 head 维度（decode 路径进来的三块本身连续，reshape 是零拷贝视图）
         query = query.reshape(batch, seq_len, -1, self.head_k_dim)   # (B, L, nk, Kd)
         key = key.reshape(batch, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch, seq_len, -1, self.head_v_dim)   # (B, L, nv, Vd)
@@ -440,13 +796,33 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 query, key, value, g=g, beta=beta, cu_seqlens=cu_seqlens,
                 initial_state=recurrent_state, output_final_state=True,
                 use_qk_l2norm_in_kernel=True)
-        elif conv_state is not None and seq_len == 1:
-            core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                query, key, value, g=a_raw, beta=b_raw,
-                A_log=self.A_log, dt_bias=self.dt_bias,
-                use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
-                initial_state=recurrent_state, output_final_state=True,
-                use_qk_l2norm_in_kernel=True)
+        elif is_step_decode:
+            # decode：走预绑定启动器（同一个 kernel / constexpr，省掉 FLA 的
+            # autograd.Function + input_guard + Heuristics + binder 开销）
+            if rec_pool is not None:
+                # 融合路径：状态直接在池里原地读写（省掉每层每步 2×33MB 的搬运）
+                try:
+                    core_attn_out = gdn_recurrent_pool_decode(
+                        query, key, value, g, beta, rec_pool, rec_slots, rec_layer)
+                    last_recurrent_state = None
+                except Exception as exc:   # pragma: no cover - 兜底
+                    if not _FLA_FALLBACK_WARNED:
+                        _FLA_FALLBACK_WARNED = True
+                        warnings.warn(f"池内 recurrent 内核不可用，回退 gather+FLA：{exc!r}")
+                    rec_state = rec_pool[rec_slots.long(), rec_layer]
+                    core_attn_out, last_recurrent_state = fla_recurrent_decode(
+                        query, key, value, g, beta, rec_state,
+                        fallback=lambda: fused_recurrent_gated_delta_rule(
+                            query, key, value, g=g, beta=beta,
+                            initial_state=rec_state, output_final_state=True,
+                            use_qk_l2norm_in_kernel=True))
+            else:
+                core_attn_out, last_recurrent_state = fla_recurrent_decode(
+                    query, key, value, g, beta, recurrent_state,
+                    fallback=lambda: fused_recurrent_gated_delta_rule(
+                        query, key, value, g=g, beta=beta,
+                        initial_state=recurrent_state, output_final_state=True,
+                        use_qk_l2norm_in_kernel=True))
         else:
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 query, key, value, g=g, beta=beta,
